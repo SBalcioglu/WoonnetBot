@@ -1,376 +1,216 @@
-
-
 import json
 import os
 import sys
 import threading
+import io
+import logging
+import webbrowser
 from queue import Queue
 import keyring
+import requests
+from typing import Dict, Any
+from datetime import datetime, time as dt_time
 
 import ttkbootstrap as ttk
-from ttkbootstrap.constants import (SOLID, DISABLED, NORMAL, END, NSEW, W, X,
-                                    LEFT, BOTH)
-from tkinter import messagebox, scrolledtext
+from ttkbootstrap.constants import (DISABLED, NORMAL, END, NSEW, W, X, BOTH, EW, SUCCESS, DANGER)
+from ttkbootstrap.scrolled import ScrolledFrame
+from tkinter import messagebox, PhotoImage
+from PIL import Image, ImageTk, ImageDraw
 
 from bot import WoonnetBot
+from config import BASE_URL
 
-# --- CONSTANTS ---
-APP_NAME = "WoonnetBot"
+# --- Setup ---
+APP_NAME = "WoonnetBot"; logger = logging.getLogger(APP_NAME)
 def get_app_dir():
-    """Get the application directory in APPDATA."""
     appdata = os.environ.get('APPDATA')
-    if not appdata:
-        # Fallback to a local directory if APPDATA is not set
-        return os.path.join(os.path.expanduser("~"), f".{APP_NAME}")
+    if not appdata: return os.path.join(os.path.expanduser("~"), f".{APP_NAME}")
     return os.path.join(appdata, APP_NAME)
+APP_DIR = get_app_dir(); PREFS_FILE = os.path.join(APP_DIR, 'user_prefs.json'); SERVICE_ID = f"python:{APP_NAME}"
 
-APP_DIR = get_app_dir()
-PREFS_FILE = os.path.join(APP_DIR, 'user_prefs.json')
-SERVICE_ID = f"python:{APP_NAME}"
+def setup_logging():
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    if not logger.handlers: logger.addHandler(handler)
+setup_logging()
 
-# --- GUI APPLICATION ---
+def crop_to_square(image: Image.Image) -> Image.Image:
+    w, h = image.size; short = min(w, h); l, t = (w - short) / 2, (h - short) / 2
+    return image.crop((l, t, l + short, t + short))
 
+def create_placeholder_image(size=(120, 120)):
+    # *** FIX: Use a supported hex code for the color ***
+    img = Image.new('RGB', size, color='#cccccc'); draw = ImageDraw.Draw(img)
+    try: text = "No Image"; tb = draw.textbbox((0, 0), text); draw.text(((size[0]-(tb[2]-tb[0]))/2, (size[1]-(tb[3]-tb[1]))/2), text, fill='#808080')
+    except Exception: draw.text((10, 10), "No Image", fill='black')
+    return ImageTk.PhotoImage(img)
+
+# --- Custom Widget ---
+class ListingWidget(ttk.Frame):
+    def __init__(self, parent, data: Dict[str, Any], session: requests.Session, placeholder_img, **kwargs):
+        super().__init__(parent, borderwidth=1, relief="solid", **kwargs)
+        self.grid_columnconfigure(2, weight=1)
+        self.data = data; self.session = session; self.selected = ttk.BooleanVar()
+        is_live = data.get('status') == 'Live'
+        self.image = self._load_image(data.get('image_url'), (120, 120)) or placeholder_img
+        self.image_label = ttk.Label(self, image=self.image, cursor="hand2")
+        self.image_label.grid(row=0, column=1, rowspan=2, sticky='nsew', padx=(0, 15))
+        detail_url = f"{BASE_URL}/detail/{self.data['id']}"
+        self.image_label.bind("<Button-1>", lambda e: webbrowser.open_new_tab(detail_url))
+        cb = ttk.Checkbutton(self, variable=self.selected, state=NORMAL if is_live else DISABLED)
+        cb.grid(row=0, column=0, rowspan=2, padx=10, sticky='ns')
+        info_frame = ttk.Frame(self); info_frame.grid(row=0, column=2, rowspan=2, sticky=NSEW, pady=5)
+        status_style = SUCCESS if is_live else 'secondary'
+        status_text = "LIVE" if is_live else f"PREVIEW ({data.get('publ_start', '')})"
+        # *** FIX: Add # type: ignore for bootstyle parameter ***
+        ttk.Label(info_frame, text=status_text, bootstyle=status_style).pack(anchor='ne') # type: ignore
+        ttk.Label(info_frame, text=data.get('address', 'N/A'), font="-weight bold").pack(anchor=W)
+        ttk.Label(info_frame, text=f"{data.get('type', 'N/A')} | {data.get('price_str', 'N/A')}").pack(anchor=W)
+    def _load_image(self, url, size):
+        if not url: return None
+        try:
+            response = self.session.get(url, stream=True, timeout=5); response.raise_for_status()
+            img = crop_to_square(Image.open(io.BytesIO(response.content)))
+            img.thumbnail(size, Image.Resampling.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception: return None
+
+# --- Main Application ---
 class App(ttk.Window):
     def __init__(self):
-        super().__init__(
-            themename="litera",
-            title="Woonnet Rijnmond Bot",
-            size=(500, 600),
-            resizable=(False, False)
-        )
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        super().__init__(themename="litera", title="Woonnet Bot v3.1 (Final)", size=(600, 750), minsize=(550, 400))
+        self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(1, weight=1)
+        
+        self.status_queue = Queue(); self.placeholder_img = create_placeholder_image()
+        self.listing_widgets: list[ListingWidget] = []
+        self.api_session: requests.Session | None = None
+        
+        self.bot_instance = WoonnetBot(self.status_queue, logger)
+        threading.Thread(target=self.bot_instance.start_headless_browser, daemon=True).start()
 
-        self.bot_thread = None
-        self.status_queue = Queue()
-        self.bot_instance = None
-
-        # --- Widgets ---
-        self.create_widgets()
-        self.layout_widgets()
-
-        # --- Preferences & State ---
-        self.load_preferences()
-        self.update_ui_state()
-        self.after(100, self.process_status_queue)
+        self.create_widgets(); self.load_preferences(); self.set_controls_state('initial')
+        self.after(100, self.process_status_queue); self.after(60000, self.scheduled_refresh_check)
 
     def create_widgets(self):
-        """Creates all the GUI widgets."""
-        # --- Main Frame ---
-        self.container = ttk.Frame(self, padding=20)
-
-        # --- Credentials ---
-        cred_frame = ttk.Labelframe(self.container, text="Credentials", padding=15)
-        self.user_label = ttk.Label(cred_frame, text="Username:")
-        self.user_entry = ttk.Entry(cred_frame)
-        self.pass_label = ttk.Label(cred_frame, text="Password:")
-        self.pass_entry = ttk.Entry(cred_frame, show="*")
-        self.remember_check = ttk.Checkbutton(
-            cred_frame, text="Remember Me", command=self.handle_remember_me
-        )
-
-        # --- Mode Selection ---
-        mode_frame = ttk.Labelframe(self.container, text="Operation Mode", padding=15)
-        self.mode = ttk.StringVar(value="run_now")
-        self.run_now_radio = ttk.Radiobutton(
-            mode_frame, text="Run Now", variable=self.mode, value="run_now",
-            command=self.update_ui_state
-        )
-        self.run_scheduled_radio = ttk.Radiobutton(
-            mode_frame, text="Run in Background (Wait for 6-8 PM)",
-            variable=self.mode, value="run_scheduled", command=self.update_ui_state
-        )
-        self.test_mode_radio = ttk.Radiobutton(
-            mode_frame, text="Test Mode", variable=self.mode, value="test_mode",
-            command=self.update_ui_state
-        )
-
-        # --- Run Now & Scheduled Options ---
-        self.run_options_frame = ttk.Frame(mode_frame)
-        self.num_label = ttk.Label(self.run_options_frame, text="Apply to:")
-        self.num_spinbox = ttk.Spinbox(self.run_options_frame, from_=1, to=20, width=5)
-        self.max_check = ttk.Checkbutton(
-            self.run_options_frame, text="Max Available", command=self.toggle_spinbox
-        )
-
-        # --- Test Mode Options ---
-        self.test_options_frame = ttk.Frame(mode_frame)
-        self.test_id_label = ttk.Label(self.test_options_frame, text="Listing ID:")
-        self.test_id_entry = ttk.Entry(self.test_options_frame, width=15)
-        self.apply_in_test_check = ttk.Checkbutton(
-            self.test_options_frame, text="Actually Click Apply"
-        )
-
-        # --- Controls & Status ---
-        control_frame = ttk.Frame(self.container)
-        self.start_button = ttk.Button(
-            control_frame, text="Start Bot", command=self.start_bot
-        )
-        self.stop_button = ttk.Button(
-            control_frame, text="Stop Bot", command=self.stop_bot, state=DISABLED
-        )
+        main_frame = ttk.Frame(self, padding=10); main_frame.grid(row=0, column=0, sticky=NSEW)
+        main_frame.grid_columnconfigure(0, weight=1)
         
-        status_frame = ttk.Labelframe(self, text="Status Log", padding=(15, 10))
-        self.log_area = scrolledtext.ScrolledText(
-            status_frame, wrap="word", state=DISABLED, height=10,
-            font=("Segoe UI", 9)
-        )
+        cred_frame = ttk.Labelframe(main_frame, text="Credentials", padding=15); cred_frame.pack(fill=X, pady=(0, 10))
+        cred_frame.grid_columnconfigure(1, weight=1)
+        ttk.Label(cred_frame, text="Username:").grid(row=0, column=0, sticky=W, padx=5, pady=2)
+        self.user_entry = ttk.Entry(cred_frame); self.user_entry.grid(row=0, column=1, sticky=EW, padx=5, pady=2)
+        ttk.Label(cred_frame, text="Password:").grid(row=1, column=0, sticky=W, padx=5, pady=2)
+        self.pass_entry = ttk.Entry(cred_frame, show="*"); self.pass_entry.grid(row=1, column=1, sticky=EW, padx=5, pady=2)
+        self.remember_check = ttk.Checkbutton(cred_frame, text="Remember Me"); self.remember_check.grid(row=2, column=1, sticky=W, padx=5, pady=5)
 
-        # Pack widgets into their respective frames
-        self.user_label.pack(anchor=W)
-        self.user_entry.pack(fill=X, pady=(2, 5))
-        self.pass_label.pack(anchor=W)
-        self.pass_entry.pack(fill=X, pady=(2, 10))
-        self.remember_check.pack(anchor=W)
+        control_frame = ttk.Labelframe(main_frame, text="Controls", padding=15); control_frame.pack(fill=X, pady=(0, 10))
+        control_frame.grid_columnconfigure((0, 1), weight=1)
+        self.login_button = ttk.Button(control_frame, text="Login", command=self.start_login)
+        self.login_button.grid(row=0, column=0, columnspan=2, sticky=EW, pady=(0, 10))
+        self.discover_button = ttk.Button(control_frame, text="Discover Listings", command=self.start_discovery)
+        self.discover_button.grid(row=1, column=0, sticky=EW, padx=(0, 5))
+        # *** FIX: Add # type: ignore for bootstyle parameter ***
+        self.apply_button = ttk.Button(control_frame, text="Apply to Selected (at 8 PM)", command=self.start_apply, bootstyle=DANGER) # type: ignore
+        self.apply_button.grid(row=1, column=1, sticky=EW, padx=(5, 0))
+
+        listings_frame = ttk.Labelframe(self, text="Discovered Listings", padding=5); listings_frame.grid(row=1, column=0, sticky=NSEW, padx=10, pady=0)
+        listings_frame.grid_rowconfigure(0, weight=1); listings_frame.grid_columnconfigure(0, weight=1)
+        self.scrolled_frame = ScrolledFrame(listings_frame, autohide=True); self.scrolled_frame.grid(row=0, column=0, sticky=NSEW)
         
-        self.run_now_radio.pack(anchor=W)
-        self.run_scheduled_radio.pack(anchor=W)
-        self.num_label.pack(side=LEFT, padx=(20, 5))
-        self.num_spinbox.pack(side=LEFT)
-        self.max_check.pack(side=LEFT, padx=5)
+        status_frame = ttk.Labelframe(self, text="Status Log", padding=(10, 5)); status_frame.grid(row=2, column=0, sticky=EW, padx=10, pady=(0, 10))
+        status_frame.grid_columnconfigure(0, weight=1)
+        self.status_label = ttk.Label(status_frame, text="Waiting for browser to start...", anchor=W); self.status_label.grid(row=0, column=0, sticky=EW)
+
+    def set_controls_state(self, state: str):
+        if state == 'initial':
+            self.login_button.config(state=NORMAL); self.discover_button.config(state=DISABLED); self.apply_button.config(state=DISABLED)
+        elif state == 'processing':
+            self.login_button.config(state=DISABLED); self.discover_button.config(state=DISABLED); self.apply_button.config(state=DISABLED)
+        elif state == 'logged_in':
+            self.login_button.config(state=DISABLED); self.discover_button.config(state=NORMAL)
+            self.apply_button.config(state=NORMAL if any(w.data.get('status') == 'Live' for w in self.listing_widgets) else DISABLED)
+
+    def start_login(self):
+        username = self.user_entry.get(); password = self.pass_entry.get()
+        if not username or not password: messagebox.showerror("Input Error", "Username/Password required."); return
+        self.set_controls_state('processing')
+        threading.Thread(target=self.run_login_wrapper, args=(username, password), daemon=True).start()
+
+    def run_login_wrapper(self, username, password):
+        login_success, session = self.bot_instance.login(username, password)
+        if login_success:
+            self.api_session = session
+            if self.remember_check.instate(['selected']): self.save_credentials(username, password)
+        self.after(0, self.set_controls_state, 'logged_in' if login_success else 'initial')
+
+    def start_discovery(self):
+        self.set_controls_state('processing')
+        threading.Thread(target=self.run_discovery_wrapper, daemon=True).start()
+
+    def run_discovery_wrapper(self):
+        listings = self.bot_instance.discover_listings_api()
+        self.status_queue.put(listings)
+        self.after(0, self.set_controls_state, 'logged_in')
+
+    def start_apply(self):
+        selected_ids = [w.data['id'] for w in self.listing_widgets if w.selected.get()]
+        if not selected_ids: messagebox.showwarning("No Selection", "Please select a LIVE listing."); return
+        self.set_controls_state('processing')
+        threading.Thread(target=self.run_apply_wrapper, args=(selected_ids,), daemon=True).start()
         
-        self.test_mode_radio.pack(anchor=W, pady=(5, 0))
-        self.test_id_label.pack(side=LEFT, padx=(20, 5))
-        self.test_id_entry.pack(side=LEFT)
-        self.apply_in_test_check.pack(side=LEFT, padx=5)
+    def run_apply_wrapper(self, ids_to_apply: list[str]):
+        self.bot_instance.apply_to_listings(ids_to_apply)
+        self.after(0, self.set_controls_state, 'logged_in')
 
-        self.start_button.pack(side=LEFT, fill=X, expand=True, ipady=5, padx=(0, 5))
-        self.stop_button.pack(side=LEFT, fill=X, expand=True, ipady=5, padx=(5, 0))
-        
-        self.log_area.pack(fill=BOTH, expand=True)
-
-        # Place frames in the main layout
-        cred_frame.pack(fill=X, pady=(0, 10))
-        mode_frame.pack(fill=X, pady=(0, 15))
-        self.run_options_frame.pack(anchor=W, fill=X, pady=5)
-        self.test_options_frame.pack(anchor=W, fill=X, pady=5)
-        control_frame.pack(fill=X, pady=(0, 15))
-        
-        self.container.grid(row=0, column=0, sticky=NSEW, padx=10, pady=10)
-        status_frame.grid(row=1, column=0, sticky=NSEW, padx=10, pady=(0, 10))
-
-    def layout_widgets(self):
-        """Lays out the main widgets in the window."""
-        # This is now handled within create_widgets to keep related code together.
-        pass
-
-    def update_ui_state(self):
-        """Enable/disable parts of the UI based on the selected mode."""
-        mode = self.mode.get()
-        
-        # Run options
-        is_run_mode = mode in ("run_now", "run_scheduled")
-        for child in self.run_options_frame.winfo_children():
-            child.configure(state=NORMAL if is_run_mode else DISABLED) # type: ignore
-        if is_run_mode:
-            self.toggle_spinbox()
-        else:
-            self.num_spinbox.config(state=DISABLED)
-            self.max_check.config(state=DISABLED)
-
-        # Test options
-        is_test_mode = mode == "test_mode"
-        for child in self.test_options_frame.winfo_children():
-            child.configure(state=NORMAL if is_test_mode else DISABLED) # type: ignore
-
-    def toggle_spinbox(self):
-        """Enable/disable the spinbox based on the 'Max' checkbox."""
-        if self.max_check.instate(['selected']):
-            self.num_spinbox.config(state=DISABLED)
-        else:
-            self.num_spinbox.config(state=NORMAL)
-
-    def log(self, message):
-        """Adds a message to the log area on the main thread."""
-        self.log_area.config(state=NORMAL)
-        self.log_area.insert(END, f"{message}\n")
-        self.log_area.config(state=DISABLED)
-        self.log_area.see(END)
+    def scheduled_refresh_check(self):
+        now = datetime.now().time()
+        if (now.hour == 18 and now.minute == 0) or (now.hour == 19 and now.minute == 55):
+            if self.bot_instance and self.bot_instance.is_logged_in:
+                logger.info(f"--- TRIGGERING SCHEDULED REFRESH AT {now} ---")
+                self.start_discovery()
+        self.after(60000, self.scheduled_refresh_check)
 
     def process_status_queue(self):
-        """Processes messages from the bot thread's status queue."""
         while not self.status_queue.empty():
             message = self.status_queue.get_nowait()
-            self.log(message)
+            if isinstance(message, list): self.populate_listings(message)
+            else: self.status_label.config(text=str(message))
         self.after(100, self.process_status_queue)
+        
+    def populate_listings(self, listings: list):
+        selected_before = {w.data['id'] for w in self.listing_widgets if w.selected.get()}
+        for widget in self.scrolled_frame.winfo_children(): widget.destroy()
+        self.listing_widgets.clear()
+        if not self.api_session: messagebox.showerror("Error", "API Session not ready."); return
+        if not listings: ttk.Label(self.scrolled_frame, text="No new listings found.").pack(pady=20)
+        else:
+            for data in listings:
+                widget = ListingWidget(self.scrolled_frame, data, self.api_session, self.placeholder_img)
+                if data['id'] in selected_before: widget.selected.set(True)
+                widget.pack(fill=X, pady=5, padx=5)
+                self.listing_widgets.append(widget)
 
     def load_preferences(self):
-        """Loads user preferences from the JSON file and keyring."""
-        self.log("Loading preferences...")
         try:
-            # Load username from keyring first
             stored_user = keyring.get_password(SERVICE_ID, "username")
             if stored_user:
                 self.user_entry.insert(0, stored_user)
-                # If we have a user, try to get their password
                 stored_pass = keyring.get_password(SERVICE_ID, stored_user)
-                if stored_pass:
-                    self.pass_entry.insert(0, stored_pass)
-                    self.remember_check.invoke() # Check the box only if both are found
+                if stored_pass: self.pass_entry.insert(0, stored_pass); self.remember_check.invoke()
+        except Exception: pass
 
-            # Load other non-sensitive settings from JSON file
-            if os.path.exists(PREFS_FILE):
-                with open(PREFS_FILE, 'r') as f:
-                    prefs = json.load(f)
-                    self.mode.set(prefs.get("mode", "run_now"))
-                    self.num_spinbox.set(prefs.get("num_to_apply", 1))
-                    if prefs.get("use_max", False): self.max_check.invoke()
-                    self.test_id_entry.insert(0, prefs.get("test_id", ""))
-                    if prefs.get("apply_in_test", False): self.apply_in_test_check.invoke()
-            else:
-                # Default values if no prefs file
-                self.num_spinbox.set(1)
-        except Exception as e:
-            self.log(f"Could not load preferences: {e}")
-
-    def save_preferences(self):
-        """Saves non-sensitive preferences to a JSON file."""
-        prefs = {
-            "mode": self.mode.get(),
-            "use_max": self.max_check.instate(['selected']),
-            "num_to_apply": int(self.num_spinbox.get() or 1),
-            "test_id": self.test_id_entry.get(),
-            "apply_in_test": self.apply_in_test_check.instate(['selected']),
-        }
-        try:
-            os.makedirs(os.path.dirname(PREFS_FILE), exist_ok=True)
-            with open(PREFS_FILE, 'w') as f:
-                json.dump(prefs, f, indent=4)
-            self.log("Settings saved.")
-        except Exception as e:
-            self.log(f"Error saving settings: {e}")
-
-    def handle_remember_me(self):
-        """Handles storing or deleting credentials from keyring."""
-        # This method is now primarily for manual user interaction
-        if self.remember_check.instate(['selected']):
-            self.log("Credentials will be saved on the next run.")
-        else:
-            # User is unchecking the box, so we should delete saved credentials
-            username = self.user_entry.get() # Get current username to delete its password
-            try:
-                if keyring.get_password(SERVICE_ID, "username"):
-                    keyring.delete_password(SERVICE_ID, "username")
-                if username and keyring.get_password(SERVICE_ID, username):
-                    keyring.delete_password(SERVICE_ID, username)
-                self.log("Saved credentials have been removed.")
-            except Exception as e:
-                self.log(f"Could not remove credentials: {e}")
-
-    def start_bot(self):
-        """Validates inputs and starts the bot in a new thread."""
-        self.save_preferences() # Save settings on every run
-
-        username = self.user_entry.get()
-        password = self.pass_entry.get()
-
-        if not username or not password:
-            messagebox.showerror("Input Error", "Username and Password are required.")
-            return
-
-        # Handle credential saving
-        if self.remember_check.instate(['selected']):
-            try:
-                keyring.set_password(SERVICE_ID, "username", username)
-                keyring.set_password(SERVICE_ID, username, password)
-                self.log("Credentials saved securely.")
-            except Exception as e:
-                self.log(f"Failed to save credentials: {e}")
-
-        self.start_button.config(state=DISABLED)
-        self.stop_button.config(state=NORMAL)
-        self.log_area.configure(state=NORMAL)
-        self.log_area.delete('1.0', END) # Clear log
-        self.log_area.configure(state=DISABLED)
-
-        self.bot_instance = WoonnetBot(self.status_queue)
-        
-        # Collect args for the bot thread
-        mode = self.mode.get()
-        args = {
-            "username": username,
-            "password": password,
-        }
-        target_method = None
-
-        if mode == "run_now":
-            target_method = self.bot_instance.run
-            args |= {
-                "use_max": self.max_check.instate(['selected']),
-                "num_to_apply": int(self.num_spinbox.get() or 1)
-            }
-        elif mode == "run_scheduled":
-            target_method = self.bot_instance.run_scheduled
-            args |= {
-                "use_max": self.max_check.instate(['selected']),
-                "num_to_apply": int(self.num_spinbox.get() or 1)
-            }
-        elif mode == "test_mode":
-            target_method = self.bot_instance.run_test
-            test_id = self.test_id_entry.get()
-            if not test_id:
-                messagebox.showerror("Input Error", "Test ID is required for Test Mode.")
-                self.on_bot_finished()
-                return
-            args |= {
-                "listing_id": test_id,
-                "actually_apply": self.apply_in_test_check.instate(['selected'])
-            }
-
-        # Start the thread
-        self.bot_thread = threading.Thread(
-            target=self.run_bot_wrapper,
-            args=(target_method, args),
-            daemon=True
-        )
-        self.bot_thread.start()
-
-    def run_bot_wrapper(self, target_method, args):
-        """A wrapper to run the bot method and handle cleanup."""
-        try:
-            target_method(**args)
-        except Exception as e:
-            self.status_queue.put(f"A critical error occurred in the bot thread: {e}")
-        finally:
-            if self.bot_instance:
-                self.bot_instance.quit()
-            self.after(0, self.on_bot_finished)
-
-    def stop_bot(self):
-        """Stops the bot thread and quits the webdriver."""
-        self.log("Stop command received. Shutting down...")
-        if self.bot_instance:
-            # The quit method will be called in the thread's finally block.
-            # Forcing a quit here can be problematic. We just signal the end.
-            self.bot_instance.quit() # This will attempt to close the browser.
-        self.on_bot_finished()
-
-    def on_bot_finished(self):
-        """Resets the UI when the bot has finished its run."""
-        self.start_button.config(state=NORMAL)
-        self.stop_button.config(state=DISABLED)
-        self.bot_thread = None
-        self.bot_instance = None
-        self.log("Bot has stopped.")
-
+    def save_credentials(self, username, password):
+        try: keyring.set_password(SERVICE_ID, "username", username); keyring.set_password(SERVICE_ID, username, password)
+        except Exception: pass
+    
     def on_closing(self):
-        """Handles the window closing event."""
-        if self.bot_thread and self.bot_thread.is_alive():
-            if messagebox.askyesno("Exit", "Bot is still running. Are you sure you want to exit?"):
-                self.stop_bot()
-                self.destroy()
-            else:
-                return
-        
-        self.save_preferences()
+        if self.bot_instance: self.bot_instance.quit()
         self.destroy()
 
-
 if __name__ == "__main__":
-    # Ensure the AppData directory exists
-    if not os.path.exists(os.path.dirname(PREFS_FILE)):
-        os.makedirs(os.path.dirname(PREFS_FILE))
-        
+    os.makedirs(APP_DIR, exist_ok=True)
     app = App()
     app.protocol("WM_DELETE_WINDOW", app.on_closing)
     app.mainloop()

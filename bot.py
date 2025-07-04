@@ -1,58 +1,60 @@
-
 import time
 import re
 import sys
 import os
-from datetime import datetime
+import threading
+import requests
+import logging
+from datetime import datetime, time as dt_time
 from queue import Queue
+from typing import List, Dict, Any, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
 
-# Import configuration
 from config import (
-    BASE_URL, LOGIN_URL, DISCOVERY_URL,
+    BASE_URL, LOGIN_URL, DISCOVERY_URL, API_DISCOVERY_URL, API_DETAILS_SINGLE_URL,
     USERNAME_FIELD_SELECTOR, PASSWORD_FIELD_SELECTOR, LOGIN_BUTTON_SELECTOR,
-    LOGOUT_LINK_SELECTOR, PRIORITY_LISTING_SELECTOR, LINK_SELECTOR,
-    PRICE_SELECTOR, FINAL_APPLY_BUTTON_SELECTOR, NEW_OFFER_TITLE_SELECTOR
+    LOGOUT_LINK_SELECTOR, CANT_APPLY_YET_SELECTOR, FINAL_APPLY_BUTTON_SELECTOR
 )
 
 class WoonnetBot:
-    """Encapsulates the bot's logic for interacting with the WoonnetRijnmond website."""
-
-    def __init__(self, status_queue: Queue):
-        self.driver = None
-        self.status_queue = status_queue
+    def __init__(self, status_queue: Queue, logger: logging.Logger):
+        self.driver: webdriver.Chrome | None = None
+        self.status_queue = status_queue; self.logger = logger
         self.service = ChromeService(ChromeDriverManager().install())
+        self.stop_event = threading.Event(); self.session = requests.Session()
+        self.is_logged_in = False
 
-    def _log(self, message):
-        """Puts a message into the status queue for the GUI to display."""
-        self.status_queue.put(message)
+    def _log(self, message: str, level: str = 'info'):
+        # *** FIX: Lambda now correctly accepts one argument ***
+        getattr(self.status_queue, 'put_nowait', lambda msg: None)(message)
+        getattr(self.logger, level, self.logger.info)(message)
 
-    def _parse_price(self, price_text):
-        """Cleans and converts a price string to a float."""
-        cleaned_price = re.sub(r'[^\d,]', '', price_text)
-        return float(cleaned_price.replace(',', '.'))
-
-    def login(self, username, password):
-        """Initializes the webdriver and logs into the website."""
-        self._log("Initializing WebDriver...")
-        # Check if running as a bundled exe and set user data dir
+    def start_headless_browser(self):
+        if self.driver: self._log("Browser already running.", "warning"); return
+        self._log("Starting persistent headless browser...")
+        options = webdriver.ChromeOptions()
+        options.add_argument("--headless=new"); options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-gpu"); options.add_argument("--log-level=3")
         if getattr(sys, 'frozen', False):
             app_dir = os.path.join(os.environ['APPDATA'], 'WoonnetBot')
             os.makedirs(app_dir, exist_ok=True)
-            options = webdriver.ChromeOptions()
             options.add_argument(f"user-data-dir={os.path.join(app_dir, 'chrome_profile')}")
-        else:
-            options = None # Use default profile behavior when running as script
+        try:
+            self.driver = webdriver.Chrome(service=self.service, options=options)
+            self._log("Headless browser started successfully.")
+        except Exception as e:
+            self._log(f"Failed to start headless browser: {e}", level='error'); self.driver = None
 
-        self.driver = webdriver.Chrome(service=self.service, options=options)
-        self._log(f"Attempting to log in as {username}...")
-        
+    def login(self, username, password) -> Tuple[bool, requests.Session | None]:
+        if not self.driver: self._log("Browser not started.", 'error'); return False, None
+        self._log(f"Attempting to log in as {username}...");
         try:
             self.driver.get(LOGIN_URL)
             WebDriverWait(self.driver, 10).until(EC.presence_of_element_located(USERNAME_FIELD_SELECTOR)).send_keys(username)
@@ -60,169 +62,125 @@ class WoonnetBot:
             WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable(LOGIN_BUTTON_SELECTOR)).click()
             WebDriverWait(self.driver, 10).until(EC.presence_of_element_located(LOGOUT_LINK_SELECTOR))
             self._log("Login successful.")
-            return True
-        except TimeoutException:
-            self._log("Login FAILED. Check credentials or website status.")
-            return False
+            for cookie in self.driver.get_cookies():
+                self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
+            self.session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+                'Accept': 'application/json, text/javascript, */*; q=0.01', 'Content-Type': 'application/json; charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest', 'Referer': DISCOVERY_URL, 'Pragma': 'no-cache', 'Cache-Control': 'no-cache',
+            })
+            self.is_logged_in = True
+            return True, self.session
         except Exception as e:
-            self._log(f"An unexpected login error occurred: {e}")
-            return False
+            self._log(f"Login error: {e}", level='error'); self.is_logged_in = False; return False, None
 
-    def discover_and_sort_listings(self):
-        """Discovers priority listings and sorts them by price."""
-        assert self.driver is not None
-        self._log("Navigating to discovery page...")
-        self.driver.get(DISCOVERY_URL)
+    def apply_to_listings(self, listing_ids: List[str]):
+        if not self.driver or not self.is_logged_in: self._log("Not logged in.", 'error'); return 0
+        if not listing_ids: self._log("No listings selected."); return 0
         
-        try:
-            # Check if the "Nog even geduld" message is present
-            title_element = self.driver.find_element(*NEW_OFFER_TITLE_SELECTOR)
-            if "Nog even geduld" in title_element.text:
-                self._log("Listings are not available yet ('Nog even geduld').")
-                return []
-        except NoSuchElementException:
-            # This is expected when listings are present
-            pass
-
-        try:
-            self._log("Waiting for priority listings to appear...")
-            WebDriverWait(self.driver, 15).until(EC.presence_of_all_elements_located(PRIORITY_LISTING_SELECTOR))
-            priority_listings = self.driver.find_elements(*PRIORITY_LISTING_SELECTOR)
-            self._log(f"Found {len(priority_listings)} priority listings.")
-            
-            targets = []
-            for listing in priority_listings:
-                try:
-                    url = listing.find_element(*LINK_SELECTOR).get_attribute('href')
-                    if url:
-                        price_text = listing.find_element(*PRICE_SELECTOR).text
-                        match = re.search(r'/(\d+)$', url)
-                        if match:
-                            targets.append({'id': match.group(1), 'price_float': self._parse_price(price_text)})
-                except Exception as e:
-                    self._log(f"Could not parse a listing, skipping. Error: {e}")
-
-            return sorted(targets, key=lambda x: x['price_float'])
-        except TimeoutException:
-            self._log("No priority listings found within the time limit.")
-            return []
-        except Exception as e:
-            self._log(f"An unexpected discovery error occurred: {e}")
-            return []
-
-    def apply_to_listings(self, targets, num_to_apply):
-        """Applies to a given number of listings from the sorted list."""
-        assert self.driver is not None
-        if not targets:
-            self._log("No targets to apply to.")
-            return 0
-
-        num_to_apply = min(num_to_apply, len(targets))
-        self._log(f"Preparing to apply to the {num_to_apply} cheapest listings...")
-        application_urls = [f"{BASE_URL}/reageren/{t['id']}" for t in targets[:num_to_apply]]
-
+        self._log(f"Pre-loading {len(listing_ids)} application pages...")
         original_window = self.driver.current_window_handle
-        for i, url in enumerate(application_urls):
-            self._log(f"Opening application page for listing {targets[i]['id']}...")
-            if i > 0:
-                self.driver.switch_to.new_window('tab')
-            self.driver.get(url)
+        
+        for lid in listing_ids:
+            if self.stop_event.is_set(): self._log("Stop command received."); return
+            self.driver.switch_to.new_window('tab'); self.driver.get(f"{BASE_URL}/reageren/{lid}")
+            self._log(f"Page for {lid} is pre-loading...")
+            
+        self._log("All pages pre-loaded. Waiting for 20:00:00...")
+        
+        while not self.stop_event.is_set():
+            now = datetime.now()
+            if now.hour >= 20: self._log("It's 20:00! Applying now!", 'warning'); break
+            remaining = (now.replace(hour=20, minute=0, second=0) - now).seconds
+            self._log(f"Waiting... T-minus {remaining} seconds.")
+            time.sleep(1)
 
+        if self.stop_event.is_set(): self._log("Stop command received during wait."); return
+        
         success_count = 0
-        # Iterate through all tabs to click the apply button
-        for i, window_handle in enumerate(self.driver.window_handles):
-            self.driver.switch_to.window(window_handle)
-            listing_id = targets[i]['id']
+        tabs_to_process = [h for h in self.driver.window_handles if h != original_window]
+        
+        start_window = dt_time(19, 59, 55); end_window = dt_time(20, 0, 15)
+        MAX_REFRESH_ATTEMPTS = 15
+
+        for i, handle in enumerate(tabs_to_process):
+            self.driver.switch_to.window(handle)
+            # *** FIX: Check if regex match exists before using it ***
+            match = re.search(r'/(\d+)$', self.driver.current_url)
+            lid = match.group(1) if match else "unknown"
+            
+            now_time = datetime.now().time()
+            if start_window <= now_time <= end_window:
+                self._log(f"({lid}) In critical window. Checking if page is ready...")
+                for attempt in range(MAX_REFRESH_ATTEMPTS):
+                    try:
+                        self.driver.find_element(*CANT_APPLY_YET_SELECTOR)
+                        self._log(f"({lid}) Attempt {attempt+1}: Not ready yet. Refreshing...", 'warning')
+                        time.sleep(0.2); self.driver.refresh()
+                    except NoSuchElementException:
+                        self._log(f"({lid}) Page is now live! Proceeding to apply.")
+                        break
+                else:
+                     self._log(f"({lid}) Page did not become ready after {MAX_REFRESH_ATTEMPTS} attempts.", 'error')
+            
+            self._log(f"({i+1}/{len(tabs_to_process)}) Attempting to click apply on listing {lid}...")
             try:
-                self._log(f"Attempting to apply on listing {listing_id}...")
-                final_button = WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable(FINAL_APPLY_BUTTON_SELECTOR))
-                final_button.click()
-                # Add a small wait to confirm submission
-                time.sleep(1) 
-                self._log(f"Successfully applied to listing {listing_id}.")
+                final_button = WebDriverWait(self.driver, 5).until(EC.element_to_be_clickable(FINAL_APPLY_BUTTON_SELECTOR))
+                final_button.click(); time.sleep(0.5)
+                self._log(f"Successfully applied to listing {lid}.")
                 success_count += 1
-            except TimeoutException:
-                self._log(f"FAILED to apply to {listing_id}: Could not find apply button in time.")
             except Exception as e:
-                self._log(f"FAILED to apply to {listing_id}: An error occurred: {e}")
+                self._log(f"FAILED to apply to listing {lid}: {e}", level='error')
 
-        # Close all tabs except the original one
-        for window_handle in self.driver.window_handles:
-            if window_handle != original_window:
-                self.driver.switch_to.window(window_handle)
-                self.driver.close()
+        self._log("Closing application tabs...")
+        for handle in tabs_to_process:
+            self.driver.switch_to.window(handle); self.driver.close()
         self.driver.switch_to.window(original_window)
-
-        self._log(f"Finished. Successfully applied to {success_count} of {num_to_apply} listings.")
+        self._log(f"Finished. Applied to {success_count} of {len(listing_ids)}.")
         return success_count
 
-    def run(self, username, password, use_max, num_to_apply):
-        """Main logic for the 'Run Now' mode."""
-        if not self.login(username, password):
-            return
-        
-        sorted_targets = self.discover_and_sort_listings()
-        if not sorted_targets:
-            self._log("No listings found. Shutting down.")
-            return
-
-        if use_max:
-            num_to_apply = len(sorted_targets)
-        
-        self.apply_to_listings(sorted_targets, num_to_apply)
-
-    def run_scheduled(self, username, password, use_max, num_to_apply):
-        """Main logic for the 'Run in Background' mode."""
-        self._log("Scheduled mode started. Waiting for the 6-8 PM window.")
-        if not self.login(username, password):
-            return
-            
-        while True:
-            now = datetime.now()
-            if 18 <= now.hour < 20:
-                self._log(f"It's {now.strftime('%H:%M')}. Within the application window. Checking for listings...")
-                sorted_targets = self.discover_and_sort_listings()
-                if sorted_targets:
-                    if use_max:
-                        num_to_apply = len(sorted_targets)
-                    self.apply_to_listings(sorted_targets, num_to_apply)
-                    self._log("Work is done for today. Shutting down.")
-                    break
-                else:
-                    self._log("No listings yet. Will check again in 1 minute.")
-                    time.sleep(60)
-            elif now.hour >= 20:
-                self._log("Application window has closed for today. Shutting down.")
-                break
-            else:
-                self._log(f"It's {now.strftime('%H:%M')}. Outside of application window. Waiting...")
-                time.sleep(300) # Wait 5 minutes
-
-    def run_test(self, username, password, listing_id, actually_apply):
-        """Applies to a single listing for testing purposes."""
-        self._log(f"Test mode started for listing ID: {listing_id}")
-        if not self.login(username, password):
-            return
-
-        assert self.driver is not None
-        url = f"{BASE_URL}/reageren/{listing_id}"
-        self._log(f"Navigating to test URL: {url}")
-        self.driver.get(url)
-        try:
-            final_button = WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable(FINAL_APPLY_BUTTON_SELECTOR))
-            self._log("Found the 'Apply' button.")
-            if actually_apply:
-                self._log("Executing click to apply...")
-                final_button.click()
-                time.sleep(3) # Wait for application to process
-                self._log(f"Test application submitted for listing {listing_id}.")
-            else:
-                self._log("Test successful. 'Apply' button was found but not clicked as requested.")
-        except Exception as e:
-            self._log(f"Test FAILED for listing {listing_id}: {e}")
-
     def quit(self):
-        """Closes the webdriver."""
+        self._log("Shutting down bot instance...")
+        self.stop_event.set()
         if self.driver:
-            self._log("Shutting down WebDriver.")
-            self.driver.quit()
+            try: self.driver.quit()
+            except WebDriverException: pass
+        self.driver = None; self.is_logged_in = False
+        
+    def _parse_price(self, price_text: str) -> float:
+        if not price_text: return 0.0
+        return float(re.sub(r'[^\d,]', '', price_text).replace(',', '.'))
+    def _parse_publ_date(self, date_str: str):
+        try: return datetime.strptime(date_str, "%B %d, %Y %H:%M:%S")
+        except (ValueError, TypeError): return None
+    def discover_listings_api(self) -> List[Dict[str, Any]]:
+        if not self.is_logged_in: self._log("Not logged in.", 'error'); return []
+        self._log("Discovering listings...")
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d"); payload = { "woonwens": { "Kenmerken": [{"waarde": "1", "geenVoorkeur": False, "kenmerkType": "24", "name": "objecttype"}], "BerekendDatumTijd": today_str }, "paginaNummer": 1, "paginaGrootte": 100, "filterMode": "AlleenNieuwVandaag" }
+            response = self.session.post(API_DISCOVERY_URL, json=payload, timeout=15); response.raise_for_status()
+            results = response.json().get('d', {}).get('resultaten', [])
+            if not results: self._log("API returned no new listings."); return []
+            listing_ids = [str(r['FrontendAdvertentieId']) for r in results if r.get('FrontendAdvertentieId')]
+            self._log(f"Found {len(listing_ids)} IDs. Fetching details...")
+        except requests.RequestException as e: self._log(f"API Error (Discovery): {e}", level='error'); return []
+        processed_listings = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_id = {executor.submit(self.get_listing_details, lid): lid for lid in listing_ids}
+            for future in as_completed(future_to_id):
+                item = future.result()
+                if item:
+                    publ_start_dt = self._parse_publ_date(item.get('publstart')); is_live = publ_start_dt and publ_start_dt <= datetime.now()
+                    main_photo = next((m for m in item.get('media', []) if m.get('type') == 'StraatFoto'), None)
+                    image_url = f"https:{main_photo['fotoviewer']}" if main_photo and main_photo.get('fotoviewer') else None
+                    processed_listings.append({
+                        'id': item.get('id'), 'address': f"{item.get('straat', '')} {item.get('huisnummer', '')}",
+                        'type': item.get('objecttype', 'N/A'), 'price_str': f"€ {item.get('kalehuur', '0,00')}",
+                        'price_float': self._parse_price(item.get('kalehuur', '')), 'status': "Live" if is_live else "Preview",
+                        'publ_start': publ_start_dt.strftime('%H:%M') if publ_start_dt else "N/A", 'image_url': image_url,
+                    })
+        self._log(f"Processed {len(processed_listings)} listings."); return sorted(processed_listings, key=lambda x: x['price_float'])
+    def get_listing_details(self, listing_id: str):
+        payload = {"Id": listing_id, "VolgendeId": 0, "Filters": "gebruik!=Complex|nieuwab==True", "inschrijfnummerTekst": "", "Volgorde": "", "hash": ""}
+        try: response = self.session.post(API_DETAILS_SINGLE_URL, json=payload, timeout=10); response.raise_for_status(); return response.json().get('d', {}).get('Aanbod')
+        except requests.RequestException: return None
