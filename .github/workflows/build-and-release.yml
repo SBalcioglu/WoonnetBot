@@ -18,16 +18,27 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.x'
+        python-version: '3.11' 
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pyinstaller
+        # It's better to install from a requirements.txt file
+        # Make sure ttkbootstrap, requests, selenium, pillow, keyring, webdriver-manager are in it
+        pip install pyinstaller ttkbootstrap requests selenium pillow keyring webdriver-manager
 
-    - name: Build the executable
-      run: pyinstaller --onefile --windowed --name WoonnetRijnmondBot hybrid_bot.py
+    - name: Build the executable with spec file
+      run: pyinstaller hybrid_bot.spec
+
+    - name: Archive release artifacts
+      run: |
+        # The output from the spec file is a folder named 'hybrid_bot' inside 'dist'
+        # We will zip this folder to create a clean release file.
+        $releasename = "WoonnetRijnmondBot-v${{ github.run_number }}"
+        Compress-Archive -Path ./dist/hybrid_bot/* -DestinationPath "./${releasename}.zip"
+        echo "RELEASE_NAME=${releasename}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        echo "ASSET_PATH=./${releasename}.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        echo "ASSET_NAME=${releasename}.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
     - name: Create Release
       id: create_release
@@ -35,10 +46,11 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: ${{ github.run_number }}
-        release_name: Release ${{ github.run_number }}
+        tag_name: v${{ github.run_number }}
+        release_name: ${{ env.RELEASE_NAME }}
         body: |
-          Automated release for commit ${{ github.sha }}
+          Automated release for commit ${{ github.sha }}.
+          Download the ZIP file below, extract it, and run `hybrid_bot.exe`.
         draft: false
         prerelease: false
 
@@ -49,6 +61,6 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./dist/WoonnetRijnmondBot.exe
-        asset_name: WoonnetRijnmondBot.exe
-        asset_content_type: application/vnd.microsoft.portable-executable
+        asset_path: ${{ env.ASSET_PATH }}
+        asset_name: ${{ env.ASSET_NAME }}
+        asset_content_type: application/zip
