@@ -6,6 +6,8 @@ DISCOVERY_URL = f"{BASE_URL}/nieuw-aanbod/"
 # --- API ENDPOINTS ---
 API_DISCOVERY_URL = "https://www.woonnetrijnmond.nl/wsWoonnetRijnmond/Woonwensen/wsWoonwensen.asmx/GetWoonwensResultatenVoorPagina"
 API_DETAILS_SINGLE_URL = "https://www.woonnetrijnmond.nl/wsWoonnetRijnmond/WoningenModule/Service.asmx/getAanbodEnVolgendeViaId"
+# *** NEW: API endpoint for the official countdown timer ***
+API_TIMER_URL = "https://www.woonnetrijnmond.nl/Umbraco/api/SqlServerTime/GetTijdTotNieuwAanbod"
 
 
 # --- SELECTORS ---

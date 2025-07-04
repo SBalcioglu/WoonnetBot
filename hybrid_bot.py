@@ -12,7 +12,7 @@ from typing import Dict, Any
 from datetime import datetime, time as dt_time
 
 import ttkbootstrap as ttk
-from ttkbootstrap.constants import (DISABLED, NORMAL, END, NSEW, W, X, BOTH, EW, SUCCESS, DANGER)
+from ttkbootstrap.constants import (DISABLED, NORMAL, END, NSEW, W, X, BOTH, EW, SUCCESS, DANGER, WARNING)
 from ttkbootstrap.scrolled import ScrolledFrame
 from tkinter import messagebox, PhotoImage
 from PIL import Image, ImageTk, ImageDraw
@@ -41,7 +41,6 @@ def crop_to_square(image: Image.Image) -> Image.Image:
     return image.crop((l, t, l + short, t + short))
 
 def create_placeholder_image(size=(120, 120)):
-    # *** FIX: Use a supported hex code for the color ***
     img = Image.new('RGB', size, color='#cccccc'); draw = ImageDraw.Draw(img)
     try: text = "No Image"; tb = draw.textbbox((0, 0), text); draw.text(((size[0]-(tb[2]-tb[0]))/2, (size[1]-(tb[3]-tb[1]))/2), text, fill='#808080')
     except Exception: draw.text((10, 10), "No Image", fill='black')
@@ -53,21 +52,32 @@ class ListingWidget(ttk.Frame):
         super().__init__(parent, borderwidth=1, relief="solid", **kwargs)
         self.grid_columnconfigure(2, weight=1)
         self.data = data; self.session = session; self.selected = ttk.BooleanVar()
-        is_live = data.get('status') == 'Live'
+        
+        # *** MODIFIED: Use new keys from the bot for more control ***
+        is_selectable = data.get('is_selectable', False)
+        status_text = data.get('status_text', 'N/A')
+
         self.image = self._load_image(data.get('image_url'), (120, 120)) or placeholder_img
         self.image_label = ttk.Label(self, image=self.image, cursor="hand2")
         self.image_label.grid(row=0, column=1, rowspan=2, sticky='nsew', padx=(0, 15))
         detail_url = f"{BASE_URL}/detail/{self.data['id']}"
         self.image_label.bind("<Button-1>", lambda e: webbrowser.open_new_tab(detail_url))
-        cb = ttk.Checkbutton(self, variable=self.selected, state=NORMAL if is_live else DISABLED)
+
+        # *** MODIFIED: Checkbox state is now controlled by 'is_selectable' ***
+        cb = ttk.Checkbutton(self, variable=self.selected, state=NORMAL if is_selectable else DISABLED)
         cb.grid(row=0, column=0, rowspan=2, padx=10, sticky='ns')
+
         info_frame = ttk.Frame(self); info_frame.grid(row=0, column=2, rowspan=2, sticky=NSEW, pady=5)
-        status_style = SUCCESS if is_live else 'secondary'
-        status_text = "LIVE" if is_live else f"PREVIEW ({data.get('publ_start', '')})"
-        # *** FIX: Add # type: ignore for bootstyle parameter ***
+        
+        # *** MODIFIED: Set label color based on the status text ***
+        if "LIVE" in status_text: status_style = SUCCESS
+        elif "SELECTABLE" in status_text: status_style = WARNING
+        else: status_style = 'secondary'
+        
         ttk.Label(info_frame, text=status_text, bootstyle=status_style).pack(anchor='ne') # type: ignore
         ttk.Label(info_frame, text=data.get('address', 'N/A'), font="-weight bold").pack(anchor=W)
         ttk.Label(info_frame, text=f"{data.get('type', 'N/A')} | {data.get('price_str', 'N/A')}").pack(anchor=W)
+
     def _load_image(self, url, size):
         if not url: return None
         try:
@@ -80,7 +90,7 @@ class ListingWidget(ttk.Frame):
 # --- Main Application ---
 class App(ttk.Window):
     def __init__(self):
-        super().__init__(themename="litera", title="Woonnet Bot v3.1 (Final)", size=(600, 750), minsize=(550, 400))
+        super().__init__(themename="litera", title="Woonnet Bot v3.2 (Pre-selection Update)", size=(600, 750), minsize=(550, 400))
         self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(1, weight=1)
         
         self.status_queue = Queue(); self.placeholder_img = create_placeholder_image()
@@ -111,7 +121,6 @@ class App(ttk.Window):
         self.login_button.grid(row=0, column=0, columnspan=2, sticky=EW, pady=(0, 10))
         self.discover_button = ttk.Button(control_frame, text="Discover Listings", command=self.start_discovery)
         self.discover_button.grid(row=1, column=0, sticky=EW, padx=(0, 5))
-        # *** FIX: Add # type: ignore for bootstyle parameter ***
         self.apply_button = ttk.Button(control_frame, text="Apply to Selected (at 8 PM)", command=self.start_apply, bootstyle=DANGER) # type: ignore
         self.apply_button.grid(row=1, column=1, sticky=EW, padx=(5, 0))
 
@@ -130,7 +139,9 @@ class App(ttk.Window):
             self.login_button.config(state=DISABLED); self.discover_button.config(state=DISABLED); self.apply_button.config(state=DISABLED)
         elif state == 'logged_in':
             self.login_button.config(state=DISABLED); self.discover_button.config(state=NORMAL)
-            self.apply_button.config(state=NORMAL if any(w.data.get('status') == 'Live' for w in self.listing_widgets) else DISABLED)
+            # *** MODIFIED: Apply button is enabled if ANY listing is selectable ***
+            any_selectable = any(w.data.get('is_selectable', False) for w in self.listing_widgets)
+            self.apply_button.config(state=NORMAL if any_selectable else DISABLED)
 
     def start_login(self):
         username = self.user_entry.get(); password = self.pass_entry.get()
@@ -144,6 +155,9 @@ class App(ttk.Window):
             self.api_session = session
             if self.remember_check.instate(['selected']): self.save_credentials(username, password)
         self.after(0, self.set_controls_state, 'logged_in' if login_success else 'initial')
+        # *** NEW: Automatically discover listings on successful login ***
+        if login_success:
+            self.after(100, self.start_discovery)
 
     def start_discovery(self):
         self.set_controls_state('processing')
@@ -151,12 +165,13 @@ class App(ttk.Window):
 
     def run_discovery_wrapper(self):
         listings = self.bot_instance.discover_listings_api()
+        # Using put instead of put_nowait as this is from a thread
         self.status_queue.put(listings)
         self.after(0, self.set_controls_state, 'logged_in')
 
     def start_apply(self):
         selected_ids = [w.data['id'] for w in self.listing_widgets if w.selected.get()]
-        if not selected_ids: messagebox.showwarning("No Selection", "Please select a LIVE listing."); return
+        if not selected_ids: messagebox.showwarning("No Selection", "Please select a listing to apply for."); return
         self.set_controls_state('processing')
         threading.Thread(target=self.run_apply_wrapper, args=(selected_ids,), daemon=True).start()
         
@@ -165,18 +180,21 @@ class App(ttk.Window):
         self.after(0, self.set_controls_state, 'logged_in')
 
     def scheduled_refresh_check(self):
-        now = datetime.now().time()
-        if (now.hour == 18 and now.minute == 0) or (now.hour == 19 and now.minute == 55):
-            if self.bot_instance and self.bot_instance.is_logged_in:
-                logger.info(f"--- TRIGGERING SCHEDULED REFRESH AT {now} ---")
+        now = datetime.now()
+        # *** MODIFIED: Refresh at 18:00 to enable selection, and at 19:55 for final status ***
+        if self.bot_instance and self.bot_instance.is_logged_in:
+            if (now.hour == 18 and now.minute == 0) or (now.hour == 19 and now.minute == 55):
+                logger.info(f"--- TRIGGERING SCHEDULED REFRESH AT {now.time()} ---")
                 self.start_discovery()
         self.after(60000, self.scheduled_refresh_check)
 
     def process_status_queue(self):
         while not self.status_queue.empty():
             message = self.status_queue.get_nowait()
-            if isinstance(message, list): self.populate_listings(message)
-            else: self.status_label.config(text=str(message))
+            if isinstance(message, list):
+                self.populate_listings(message)
+            else:
+                self.status_label.config(text=str(message))
         self.after(100, self.process_status_queue)
         
     def populate_listings(self, listings: list):
@@ -191,6 +209,8 @@ class App(ttk.Window):
                 if data['id'] in selected_before: widget.selected.set(True)
                 widget.pack(fill=X, pady=5, padx=5)
                 self.listing_widgets.append(widget)
+        # *** NEW: After populating, re-evaluate the control states ***
+        self.set_controls_state('logged_in')
 
     def load_preferences(self):
         try:

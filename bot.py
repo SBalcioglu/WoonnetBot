@@ -20,7 +20,8 @@ from selenium.common.exceptions import TimeoutException, WebDriverException, NoS
 from config import (
     BASE_URL, LOGIN_URL, DISCOVERY_URL, API_DISCOVERY_URL, API_DETAILS_SINGLE_URL,
     USERNAME_FIELD_SELECTOR, PASSWORD_FIELD_SELECTOR, LOGIN_BUTTON_SELECTOR,
-    LOGOUT_LINK_SELECTOR, CANT_APPLY_YET_SELECTOR, FINAL_APPLY_BUTTON_SELECTOR
+    LOGOUT_LINK_SELECTOR, CANT_APPLY_YET_SELECTOR, FINAL_APPLY_BUTTON_SELECTOR,
+    API_TIMER_URL
 )
 
 class WoonnetBot:
@@ -32,7 +33,6 @@ class WoonnetBot:
         self.is_logged_in = False
 
     def _log(self, message: str, level: str = 'info'):
-        # *** FIX: Lambda now correctly accepts one argument ***
         getattr(self.status_queue, 'put_nowait', lambda msg: None)(message)
         getattr(self.logger, level, self.logger.info)(message)
 
@@ -74,55 +74,90 @@ class WoonnetBot:
         except Exception as e:
             self._log(f"Login error: {e}", level='error'); self.is_logged_in = False; return False, None
 
+    def _get_server_countdown_seconds(self) -> float | None:
+        self._log("Fetching precise countdown from server API...")
+        try:
+            response = self.session.get(API_TIMER_URL, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            remaining_ms = int(data['resterendetijd'])
+            if remaining_ms <= 0:
+                self._log("Server countdown is zero or negative. Proceeding immediately.", "warning")
+                return 0.0
+            seconds = remaining_ms / 1000.0
+            self._log(f"Success! Server countdown received: {seconds:.2f} seconds.")
+            return seconds
+        except requests.RequestException as e:
+            self._log(f"API Error (Timer): Could not get official time. {e}", "error")
+            return None
+        except (KeyError, ValueError, TypeError) as e:
+            self._log(f"API Error (Timer): Could not parse server response. {e}", "error")
+            return None
+
     def apply_to_listings(self, listing_ids: List[str]):
         if not self.driver or not self.is_logged_in: self._log("Not logged in.", 'error'); return 0
         if not listing_ids: self._log("No listings selected."); return 0
-        
+
         self._log(f"Pre-loading {len(listing_ids)} application pages...")
         original_window = self.driver.current_window_handle
-        
+
         for lid in listing_ids:
             if self.stop_event.is_set(): self._log("Stop command received."); return
             self.driver.switch_to.new_window('tab'); self.driver.get(f"{BASE_URL}/reageren/{lid}")
             self._log(f"Page for {lid} is pre-loading...")
-            
-        self._log("All pages pre-loaded. Waiting for 20:00:00...")
+
+        self._log("All pages pre-loaded. Determining wait time...")
         
-        while not self.stop_event.is_set():
-            now = datetime.now()
-            if now.hour >= 20: self._log("It's 20:00! Applying now!", 'warning'); break
-            remaining = (now.replace(hour=20, minute=0, second=0) - now).seconds
-            self._log(f"Waiting... T-minus {remaining} seconds.")
-            time.sleep(1)
+        remaining_seconds = self._get_server_countdown_seconds()
+
+        if remaining_seconds is not None and remaining_seconds > 0:
+            start_time = time.monotonic()
+            while not self.stop_event.is_set():
+                elapsed = time.monotonic() - start_time
+                if elapsed >= remaining_seconds:
+                    self._log("Server countdown finished! Applying now!", 'warning')
+                    break
+
+                time_left = remaining_seconds - elapsed
+                mins, secs = divmod(time_left, 60)
+                hours, mins = divmod(mins, 60)
+                timer_display = f"{int(hours):02}:{int(mins):02}:{int(secs):02}"
+                self._log(f"Waiting for server... T-minus {timer_display}")
+                time.sleep(1)
+        else:
+            self._log("Could not get server time or time is up. Falling back to 8 PM check.", "warning")
+            while not self.stop_event.is_set():
+                now = datetime.now()
+                if now.hour >= 20:
+                    self._log("It's 20:00! Applying now!", 'warning'); break
+                remaining = (now.replace(hour=20, minute=0, second=0) - now).seconds
+                self._log(f"Waiting (fallback)... T-minus {remaining} seconds.")
+                time.sleep(1)
 
         if self.stop_event.is_set(): self._log("Stop command received during wait."); return
-        
+
         success_count = 0
         tabs_to_process = [h for h in self.driver.window_handles if h != original_window]
         
-        start_window = dt_time(19, 59, 55); end_window = dt_time(20, 0, 15)
         MAX_REFRESH_ATTEMPTS = 15
 
         for i, handle in enumerate(tabs_to_process):
             self.driver.switch_to.window(handle)
-            # *** FIX: Check if regex match exists before using it ***
             match = re.search(r'/(\d+)$', self.driver.current_url)
             lid = match.group(1) if match else "unknown"
-            
-            now_time = datetime.now().time()
-            if start_window <= now_time <= end_window:
-                self._log(f"({lid}) In critical window. Checking if page is ready...")
-                for attempt in range(MAX_REFRESH_ATTEMPTS):
-                    try:
-                        self.driver.find_element(*CANT_APPLY_YET_SELECTOR)
-                        self._log(f"({lid}) Attempt {attempt+1}: Not ready yet. Refreshing...", 'warning')
-                        time.sleep(0.2); self.driver.refresh()
-                    except NoSuchElementException:
-                        self._log(f"({lid}) Page is now live! Proceeding to apply.")
-                        break
-                else:
-                     self._log(f"({lid}) Page did not become ready after {MAX_REFRESH_ATTEMPTS} attempts.", 'error')
-            
+
+            self._log(f"({lid}) Checking if page is ready...")
+            for attempt in range(MAX_REFRESH_ATTEMPTS):
+                try:
+                    self.driver.find_element(*CANT_APPLY_YET_SELECTOR)
+                    self._log(f"({lid}) Attempt {attempt+1}: Not ready yet. Refreshing...", 'warning')
+                    time.sleep(0.2); self.driver.refresh()
+                except NoSuchElementException:
+                    self._log(f"({lid}) Page is now live! Proceeding to apply.")
+                    break
+            else:
+                 self._log(f"({lid}) Page did not become ready after {MAX_REFRESH_ATTEMPTS} attempts.", 'error')
+
             self._log(f"({i+1}/{len(tabs_to_process)}) Attempting to click apply on listing {lid}...")
             try:
                 final_button = WebDriverWait(self.driver, 5).until(EC.element_to_be_clickable(FINAL_APPLY_BUTTON_SELECTOR))
@@ -146,13 +181,14 @@ class WoonnetBot:
             try: self.driver.quit()
             except WebDriverException: pass
         self.driver = None; self.is_logged_in = False
-        
+
     def _parse_price(self, price_text: str) -> float:
         if not price_text: return 0.0
         return float(re.sub(r'[^\d,]', '', price_text).replace(',', '.'))
     def _parse_publ_date(self, date_str: str):
         try: return datetime.strptime(date_str, "%B %d, %Y %H:%M:%S")
         except (ValueError, TypeError): return None
+
     def discover_listings_api(self) -> List[Dict[str, Any]]:
         if not self.is_logged_in: self._log("Not logged in.", 'error'); return []
         self._log("Discovering listings...")
@@ -170,16 +206,35 @@ class WoonnetBot:
             for future in as_completed(future_to_id):
                 item = future.result()
                 if item:
-                    publ_start_dt = self._parse_publ_date(item.get('publstart')); is_live = publ_start_dt and publ_start_dt <= datetime.now()
+                    # *** MODIFIED: More detailed status logic ***
+                    now = datetime.now()
+                    publ_start_dt = self._parse_publ_date(item.get('publstart'))
+                    is_live = publ_start_dt and now >= publ_start_dt
+                    
+                    is_in_selectable_window = now.hour >= 18
+                    can_be_selected = is_live or (is_in_selectable_window and not is_live)
+                    
+                    status_text = "LIVE"
+                    if not is_live:
+                        start_time_str = publ_start_dt.strftime('%H:%M') if publ_start_dt else "20:00"
+                        if is_in_selectable_window:
+                            status_text = f"SELECTABLE ({start_time_str})"
+                        else:
+                            status_text = f"PREVIEW ({start_time_str})"
+
                     main_photo = next((m for m in item.get('media', []) if m.get('type') == 'StraatFoto'), None)
                     image_url = f"https:{main_photo['fotoviewer']}" if main_photo and main_photo.get('fotoviewer') else None
+                    
                     processed_listings.append({
                         'id': item.get('id'), 'address': f"{item.get('straat', '')} {item.get('huisnummer', '')}",
                         'type': item.get('objecttype', 'N/A'), 'price_str': f"€ {item.get('kalehuur', '0,00')}",
-                        'price_float': self._parse_price(item.get('kalehuur', '')), 'status': "Live" if is_live else "Preview",
-                        'publ_start': publ_start_dt.strftime('%H:%M') if publ_start_dt else "N/A", 'image_url': image_url,
+                        'price_float': self._parse_price(item.get('kalehuur', '')), 
+                        'status_text': status_text,
+                        'is_selectable': can_be_selected,
+                        'image_url': image_url,
                     })
         self._log(f"Processed {len(processed_listings)} listings."); return sorted(processed_listings, key=lambda x: x['price_float'])
+        
     def get_listing_details(self, listing_id: str):
         payload = {"Id": listing_id, "VolgendeId": 0, "Filters": "gebruik!=Complex|nieuwab==True", "inschrijfnummerTekst": "", "Volgorde": "", "hash": ""}
         try: response = self.session.post(API_DETAILS_SINGLE_URL, json=payload, timeout=10); response.raise_for_status(); return response.json().get('d', {}).get('Aanbod')
