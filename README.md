@@ -25,3 +25,4 @@ The easiest way to use this bot is to download the latest executable from the **
 ## Automated Builds
 
 This repository is configured with a GitHub Actions workflow that automatically builds a new executable (`.exe`) and creates a new release every time a commit is pushed to the `main` branch.
+^ Note, currently not functional
