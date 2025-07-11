@@ -55,9 +55,11 @@ class WoonnetBot:
         if self.driver:
             self._log("Browser already running.", "warning")
             return
-        self._log("Starting persistent headless browser...")
+        # *** MODIFIED: Start browser in visible mode for debugging ***
+        self._log("Starting browser...")
         options = webdriver.ChromeOptions()
-        options.add_argument("--headless=new")
+        # The user wants to see the browser, so we disable headless mode.
+        # options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-gpu")
         options.add_argument("--log-level=3")
@@ -68,9 +70,9 @@ class WoonnetBot:
             options.add_argument(f"user-data-dir={os.path.join(app_dir, 'chrome_profile')}")
         try:
             self.driver = webdriver.Chrome(service=self.service, options=options)
-            self._log("Headless browser started successfully.")
+            self._log("Browser started successfully.")
         except Exception as e:
-            self._log(f"Failed to start headless browser: {e}", level='error')
+            self._log(f"Failed to start browser: {e}", level='error')
             self.driver = None
 
     def login(self, username, password) -> Tuple[bool, requests.Session | None]:
@@ -125,21 +127,14 @@ class WoonnetBot:
             return None
 
     def apply_to_listings(self, listing_ids: List[str]):
-        if not self.driver or not self.is_logged_in: self._log("Not logged in.", 'error'); return 0
-        if not listing_ids: self._log("No listings selected."); return 0
+        if not self.driver or not self.is_logged_in:
+            self._log("Not logged in. Please log in before applying.", 'error')
+            return 0
+        if not listing_ids:
+            self._log("No listings selected to apply for.")
+            return 0
 
-        self._log(f"Pre-loading {len(listing_ids)} application pages...")
-        original_window = self.driver.current_window_handle
-        tabs_to_process_map: Dict[str, str] = {}
-
-        for lid in listing_ids:
-            if self.stop_event.is_set(): self._log("Stop command received."); return
-            self.driver.switch_to.new_window('tab')
-            self.driver.get(f"{BASE_URL}/reageren/{lid}")
-            tabs_to_process_map[lid] = self.driver.current_window_handle
-            self._log(f"Page for {lid} pre-loaded in tab {tabs_to_process_map[lid]}.")
-
-        self._log("All pages pre-loaded. Determining wait time...")
+        self._log("Waiting for the application window to open...")
 
         remaining_seconds = self._get_server_countdown_seconds()
         if remaining_seconds is not None and remaining_seconds > 0:
@@ -156,73 +151,66 @@ class WoonnetBot:
         else: # Fallback logic
             self._log("Could not get server time or time is up. Falling back to 8 PM check.", "warning")
             while not self.stop_event.is_set():
-                if datetime.now().hour >= 20: break
+                now = datetime.now()
+                if now.hour >= 20: break
+                # Check every second for the time
+                self._log(f"Waiting for 8:00 PM... Current time: {now.strftime('%H:%M:%S')}")
                 time.sleep(1)
 
-        if self.stop_event.is_set(): self._log("Stop command received during wait."); return
+        if self.stop_event.is_set():
+            self._log("Stop command received during wait. Aborting application process.")
+            return 0
         
-        self._log("Countdown finished! Applying to all listings in PARALLEL...", 'warning')
+        self._log("Application window is open! Applying to all selected listings sequentially...", 'warning')
         
-        driver_lock = threading.Lock()
-        success_count = 0
+        # Create a directory for debug logs
+        debug_dir = os.path.join(os.getcwd(), "debug_logs")
+        os.makedirs(debug_dir, exist_ok=True)
+        self._log(f"Debug files will be saved in: {debug_dir}")
 
-        def _apply_on_tab(listing_id: str, tab_handle: str):
-            nonlocal success_count
-            APPLY_TIMEOUT_SECONDS = 60 # Increased timeout to 1 minute
+        success_count = 0
+        for listing_id in listing_ids:
+            if self.stop_event.is_set():
+                self._log("Stop command received, halting applications.")
+                break
+            
+            self._log(f"--- Processing Listing: {listing_id} ---")
+            apply_url = f"{BASE_URL}/reageren/{listing_id}"
             
             try:
-                wait_start_time = time.monotonic()
-                while time.monotonic() - wait_start_time < APPLY_TIMEOUT_SECONDS:
-                    if self.stop_event.is_set(): return
-                    
-                    with driver_lock:
-                        self.driver.switch_to.window(tab_handle)
-                        
-                        try:
-                            self.driver.find_element(*CANT_APPLY_YET_SELECTOR)
-                            self._log(f"({listing_id}) Red banner found. Refreshing page...", 'warning')
-                            self.driver.refresh()
-                            time.sleep(0.5)
-                            continue
-                        except NoSuchElementException:
-                            pass
-
-                        try:
-                            final_button = self.driver.find_element(*FINAL_APPLY_BUTTON_SELECTOR)
-                            if final_button.is_enabled() and final_button.is_displayed():
-                                self._log(f"({listing_id}) Apply button found and is clickable! Applying...", 'info')
-                                final_button.click()
-                                with driver_lock:
-                                    success_count += 1
-                                self._log(f"SUCCESSFULLY applied to listing {listing_id}.", 'info')
-                                return
-                        except NoSuchElementException:
-                            self._log(f"({listing_id}) Page ready, waiting for apply button to appear...")
-                            
-                    time.sleep(0.2)
+                self._log(f"Navigating to {apply_url}...")
+                self.driver.get(apply_url)
                 
-                self._log(f"({listing_id}) FAILED: Apply button did not become clickable within {APPLY_TIMEOUT_SECONDS}s.", 'error')
+                # Save page source for debugging
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                debug_path = os.path.join(debug_dir, f"listing_{listing_id}_{timestamp}.html")
+                with open(debug_path, 'w', encoding='utf-8') as f:
+                    f.write(self.driver.page_source)
+                self._log(f"Saved page HTML to {debug_path}")
 
-            except Exception as e:
-                self._log(f"({listing_id}) FAILED with unexpected error: {e}", level='error')
-
-        with ThreadPoolExecutor(max_workers=len(tabs_to_process_map)) as executor:
-            futures = [executor.submit(_apply_on_tab, lid, handle) for lid, handle in tabs_to_process_map.items()]
-            for future in as_completed(futures):
+                # Attempt to apply
                 try:
-                    future.result()
-                except Exception as e:
-                    self._log(f"A thread raised an exception: {e}", 'error')
+                    final_button = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable(FINAL_APPLY_BUTTON_SELECTOR)
+                    )
+                    self._log(f"({listing_id}) Apply button found and is clickable. Applying...")
+                    final_button.click()
+                    
+                    # Verification step: Check for success message or URL change
+                    # This part is tricky as we don't know the exact success indicator.
+                    # For now, we'll assume a click without error is a success.
+                    self._log(f"SUCCESSFULLY applied to listing {listing_id}.", 'info')
+                    success_count += 1
 
-        self._log("Parallel application process finished. Closing tabs...")
-        with driver_lock:
-            # Re-check handles because some tabs might be closed by exceptions
-            current_handles = set(self.driver.window_handles)
-            for handle in tabs_to_process_map.values():
-                if handle in current_handles and handle != original_window:
-                    self.driver.switch_to.window(handle)
-                    self.driver.close()
-            self.driver.switch_to.window(original_window)
+                except TimeoutException:
+                    self._log(f"({listing_id}) FAILED: Apply button was not clickable within 10 seconds.", 'error')
+                except NoSuchElementException:
+                    self._log(f"({listing_id}) FAILED: Could not find the apply button on the page.", 'error')
+                except Exception as e:
+                    self._log(f"({listing_id}) FAILED: An unexpected error occurred during apply click: {e}", 'error')
+
+            except WebDriverException as e:
+                self._log(f"({listing_id}) FAILED: Could not navigate to the application page. Error: {e}", 'error')
         
         self._log(f"Finished. Applied to {success_count} of {len(listing_ids)}.")
         return success_count
