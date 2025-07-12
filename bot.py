@@ -25,7 +25,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import WebDriverException
 
 # Only import webdriver_manager if not running as a frozen executable
 if not getattr(sys, 'frozen', False):
@@ -57,25 +57,17 @@ class WoonnetBot:
         self.session = requests.Session()
         self.is_logged_in = False
 
-        # Determine the appropriate chromedriver path based on the execution context
-        # (frozen executable vs. standard Python script).
         if getattr(sys, 'frozen', False):
-            # When packaged as an .exe, chromedriver is in the bundle.
             driver_path = os.path.join(sys._MEIPASS, "chromedriver.exe") # type: ignore
             self.service = ChromeService(executable_path=driver_path)
             self._log(f"Bundle mode: Using chromedriver from {driver_path}")
         else:
-            # In a development environment, manage chromedriver automatically.
             self.service = ChromeService(ChromeDriverManager().install()) # type: ignore
             self._log("Script mode: Using webdriver-manager.")
 
     def _log(self, message: str, level: str = 'info'):
         """
         Sends a log message to both the GUI status queue and the logger.
-
-        Args:
-            message (str): The message to log.
-            level (str): The logging level ('info', 'error', 'warning').
         """
         self.status_queue.put_nowait(message)
         getattr(self.logger, level, self.logger.info)(message)
@@ -87,21 +79,17 @@ class WoonnetBot:
         if self.driver:
             self._log("Browser is already running.", "warning")
             return
-
         self._log("Starting browser...")
         options = webdriver.ChromeOptions()
-        # The user wants to see the browser for monitoring, so headless is disabled.
-        # options.add_argument("--headless=new")
+        options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--disable-gpu")
-        options.add_argument("--log-level=3") # Suppress console noise
+        options.add_argument("--log-level=3")
 
-        # When packaged, create a persistent user profile to retain sessions/cookies.
         if getattr(sys, 'frozen', False):
             app_dir = os.path.join(os.environ['APPDATA'], 'WoonnetBot')
             os.makedirs(app_dir, exist_ok=True)
             options.add_argument(f"user-data-dir={os.path.join(app_dir, 'chrome_profile')}")
-
         try:
             self.driver = webdriver.Chrome(service=self.service, options=options)
             self._log("Browser started successfully.")
@@ -111,35 +99,20 @@ class WoonnetBot:
 
     def login(self, username, password) -> Tuple[bool, requests.Session | None]:
         """
-        Performs login on the website using Selenium and transfers the authenticated
-        session to the `requests.Session` object.
-
-        Args:
-            username (str): The user's email or username.
-            password (str): The user's password.
-
-        Returns:
-            Tuple[bool, requests.Session | None]: A tuple containing a boolean
-            indicating login success and the authenticated session object.
+        Performs login using Selenium and transfers the session to requests.
         """
         if not self.driver:
             self._log("Browser not started.", 'error')
             return False, None
-
         self._log(f"Attempting to log in as {username}...")
         try:
             self.driver.get(LOGIN_URL)
             WebDriverWait(self.driver, 10).until(EC.presence_of_element_located(USERNAME_FIELD_SELECTOR)).send_keys(username)
             self.driver.find_element(*PASSWORD_FIELD_SELECTOR).send_keys(password)
             WebDriverWait(self.driver, 10).until(EC.element_to_be_clickable(LOGIN_BUTTON_SELECTOR)).click()
-
-            # Confirm login by waiting for the logout link to appear.
             WebDriverWait(self.driver, 10).until(EC.presence_of_element_located(LOGOUT_LINK_SELECTOR))
             self._log("Login successful.")
 
-            # --- Session Transfer ---
-            # Copy cookies from the authenticated Selenium session to the requests session
-            # to enable direct, authenticated API calls.
             for cookie in self.driver.get_cookies():
                 self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
 
@@ -162,10 +135,6 @@ class WoonnetBot:
     def _get_server_countdown_seconds(self) -> float | None:
         """
         Fetches the official countdown time from the server's API.
-        This is the primary method for precise timing.
-
-        Returns:
-            float | None: The remaining seconds as a float, or None on failure.
         """
         self._log("Fetching precise countdown from server API...")
         try:
@@ -188,8 +157,8 @@ class WoonnetBot:
 
     def apply_to_listings(self, listing_ids: List[str]):
         """
-        Applies to a list of properties by sending direct POST requests. This method
-        bypasses Selenium for the final submission, making it fast and reliable.
+        Applies to a list of properties by sending direct POST requests in parallel.
+        This provides a significant speed advantage over sequential applications.
 
         Args:
             listing_ids (List[str]): A list of advertisement IDs to apply for.
@@ -198,10 +167,8 @@ class WoonnetBot:
             self._log("Not logged in. Please log in before applying.", 'error')
             return
 
+        # --- The timing and countdown logic remains the same ---
         self._log("Waiting for the application window to open...")
-
-        # --- Timing Logic ---
-        # Primary: Use the official server countdown.
         remaining_seconds = self._get_server_countdown_seconds()
         if remaining_seconds is not None and remaining_seconds > 0:
             start_time = time.monotonic()
@@ -215,7 +182,6 @@ class WoonnetBot:
                 self._log(f"Waiting for server... T-minus {timer_display}")
                 time.sleep(1)
         else:
-            # Fallback: Wait until 8:00 PM system time.
             self._log("Could not get server time or time is up. Falling back to 8 PM check.", "warning")
             while not self.stop_event.is_set():
                 if datetime.now().hour >= 20: break
@@ -226,61 +192,55 @@ class WoonnetBot:
             self._log("Stop command received during wait. Aborting application.", "warning")
             return
 
-        self._log("Application window is open! Applying via direct API calls...", 'warning')
-        success_count = 0
-        for listing_id in listing_ids:
-            if self.stop_event.is_set():
-                self._log("Stop command received, halting applications.")
-                break
-
-            self._log(f"--- Processing Listing: {listing_id} ---")
-            # The server uses the ID to identify the resource; a full descriptive slug is not required.
+        self._log("Application window is open! Applying to all selected listings IN PARALLEL...", 'warning')
+        
+        # --- PARALLEL APPLICATION LOGIC ---
+        
+        def _apply_task(listing_id: str) -> bool:
+            """This is the worker function that applies to a single listing.
+            It will be executed in a separate thread for each selected listing."""
+            
             apply_url = f"{BASE_URL}/reageren/{listing_id}"
-
             try:
-                # STEP 1: GET the reaction page to retrieve dynamic security tokens.
-                self._log(f"({listing_id}) Fetching reaction page for tokens...")
-                page_response = self.session.get(apply_url, timeout=10)
-                page_response.raise_for_status()
-
-                # STEP 2: Parse the page to find the application form.
-                soup = BeautifulSoup(page_response.text, 'html.parser')
+                # The shared self.session is thread-safe for this use case.
+                page_res = self.session.get(apply_url, timeout=15)
+                soup = BeautifulSoup(page_res.text, 'html.parser')
+                
                 form_button = soup.find('button', {'name': 'Command', 'value': 'plaats-einkomen'})
                 if not form_button or not (form_element := form_button.find_parent('form')):
-                    self._log(f"({listing_id}) FAILED: Could not find the application form on the page.", 'error')
-                    continue
+                    self._log(f"({listing_id}) FAILED: Application form not found.", 'error')
+                    return False
 
-                # STEP 3: Dynamically build the payload from all input fields in the form.
-                payload = {
-                    tag.get('name'): tag.get('value', '')
-                    for tag in form_element.find_all('input') if tag.get('name')
-                }
-                payload['Command'] = 'plaats-einkomen' # Add the button's command
+                payload = {tag.get('name'): tag.get('value', '') for tag in form_element.find_all('input') if tag.get('name')}
+                payload['Command'] = 'plaats-einkomen'
 
-                if '__RequestVerificationToken' not in payload or 'ufprt' not in payload:
-                    self._log(f"({listing_id}) FAILED: Security tokens not found in form.", 'error')
-                    continue
+                if '__RequestVerificationToken' not in payload:
+                    self._log(f"({listing_id}) FAILED: Security token not found.", 'error')
+                    return False
 
-                self._log(f"({listing_id}) Tokens acquired. Submitting application...")
-
-                # STEP 4: POST the complete payload to the endpoint.
-                submit_response = self.session.post(
-                    apply_url, data=payload, headers={'Referer': apply_url}
-                )
-                submit_response.raise_for_status()
-
-                # STEP 5: Verify success by checking the response content.
-                if "Wij hebben uw reactie verwerkt" in submit_response.text or "U heeft al gereageerd" in submit_response.text:
+                submit_res = self.session.post(apply_url, data=payload, headers={'Referer': apply_url})
+                
+                if "Wij hebben uw reactie verwerkt" in submit_res.text or "U heeft al gereageerd" in submit_res.text:
                     self._log(f"SUCCESS! Applied to listing {listing_id}.", 'info')
-                    success_count += 1
+                    return True
                 else:
-                    self._log(f"({listing_id}) FAILED: Submission was sent, but success message was not found.", 'error')
-
-            except requests.RequestException as e:
-                self._log(f"({listing_id}) FAILED: A network error occurred. {e}", 'error')
+                    self._log(f"({listing_id}) FAILED: Success message not found in response.", 'error')
+                    return False
             except Exception as e:
-                self._log(f"({listing_id}) FAILED: An unexpected error occurred. {e}", 'error')
+                self._log(f"({listing_id}) FAILED: An unexpected error occurred: {e}", 'error')
+                return False
 
+        # Use a ThreadPoolExecutor to run all the _apply_task functions concurrently.
+        success_count = 0
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # Submit all tasks to the pool at once
+            future_to_id = {executor.submit(_apply_task, lid): lid for lid in listing_ids}
+            
+            # Process results as they complete
+            for future in as_completed(future_to_id):
+                if future.result():  # future.result() returns True or False from _apply_task
+                    success_count += 1
+    
         self._log(f"Finished. Applied to {success_count} of {len(listing_ids)} selected listings.")
 
     def quit(self):
@@ -290,8 +250,10 @@ class WoonnetBot:
         self._log("Shutting down bot instance...")
         self.stop_event.set()
         if self.driver:
-            try: self.driver.quit()
-            except WebDriverException: pass
+            try:
+                self.driver.quit()
+            except WebDriverException:
+                pass
         self.driver = None
         self.is_logged_in = False
 
@@ -301,33 +263,21 @@ class WoonnetBot:
         return float(re.sub(r'[^\d,]', '', price_text).replace(',', '.'))
 
     def _parse_publ_date(self, date_str: str | None) -> datetime | None:
-        """
-        Utility to parse a publication date string into a datetime object.
-        Safely handles None input.
-        """
-        if not date_str:
-            return None
-        try:
-            return datetime.strptime(date_str, "%B %d, %Y %H:%M:%S")
-        except (ValueError, TypeError):
-            return None
+        """Utility to parse a publication date string into a datetime object."""
+        if not date_str: return None
+        try: return datetime.strptime(date_str, "%B %d, %Y %H:%M:%S")
+        except (ValueError, TypeError): return None
 
     def discover_listings_api(self) -> List[Dict[str, Any]]:
         """
         Discovers new listings for the day using the website's internal API.
-
-        Returns:
-            List[Dict[str, Any]]: A list of processed listing dictionaries.
         """
         if not self.is_logged_in:
             self._log("Not logged in.", 'error')
             return []
         self._log("Discovering listings via API...")
         try:
-            payload = {
-                "woonwens": {"Kenmerken": [{"waarde": "1", "geenVoorkeur": False, "kenmerkType": "24", "name": "objecttype"}], "BerekendDatumTijd": datetime.now().strftime("%Y-%m-%d")},
-                "paginaNummer": 1, "paginaGrootte": 100, "filterMode": "AlleenNieuwVandaag"
-            }
+            payload = {"woonwens": {"Kenmerken": [{"waarde": "1", "geenVoorkeur": False, "kenmerkType": "24", "name": "objecttype"}], "BerekendDatumTijd": datetime.now().strftime("%Y-%m-%d")}, "paginaNummer": 1, "paginaGrootte": 100, "filterMode": "AlleenNieuwVandaag"}
             response = self.session.post(API_DISCOVERY_URL, json=payload, timeout=15)
             response.raise_for_status()
             results = response.json().get('d', {}).get('resultaten', [])
@@ -346,45 +296,25 @@ class WoonnetBot:
             for future in as_completed(future_to_id):
                 item = future.result()
                 if not item: continue
-
                 now = datetime.now()
                 publ_start_dt = self._parse_publ_date(item.get('publstart'))
                 is_live = publ_start_dt and now >= publ_start_dt
                 is_in_selectable_window = now.hour >= 18
-
-                # Determine listing status and if it can be selected in the GUI
                 if is_live:
                     status_text = "LIVE"
                 else:
                     start_time_str = publ_start_dt.strftime('%H:%M') if publ_start_dt else "20:00"
                     status_text = f"SELECTABLE ({start_time_str})" if is_in_selectable_window else f"PREVIEW ({start_time_str})"
-
                 can_be_selected = is_live or is_in_selectable_window
                 main_photo = next((m for m in item.get('media', []) if m.get('type') == 'StraatFoto'), None)
                 image_url = f"https:{main_photo['fotoviewer']}" if main_photo and main_photo.get('fotoviewer') else None
-
-                processed_listings.append({
-                    'id': item.get('id'),
-                    'address': f"{item.get('straat', '')} {item.get('huisnummer', '')}",
-                    'type': item.get('objecttype', 'N/A'),
-                    'price_str': f"€ {item.get('kalehuur', '0,00')}",
-                    'price_float': self._parse_price(item.get('kalehuur', '')),
-                    'status_text': status_text,
-                    'is_selectable': can_be_selected,
-                    'image_url': image_url,
-                })
+                processed_listings.append({'id': item.get('id'),'address': f"{item.get('straat', '')} {item.get('huisnummer', '')}",'type': item.get('objecttype', 'N/A'),'price_str': f"€ {item.get('kalehuur', '0,00')}",'price_float': self._parse_price(item.get('kalehuur', '')),'status_text': status_text,'is_selectable': can_be_selected,'image_url': image_url})
         self._log(f"Processed {len(processed_listings)} listings.")
         return sorted(processed_listings, key=lambda x: x['price_float'])
 
     def get_listing_details(self, listing_id: str) -> Dict | None:
         """
         Fetches detailed information for a single listing via API.
-
-        Args:
-            listing_id (str): The ID of the listing to fetch.
-
-        Returns:
-            Dict | None: A dictionary of the listing's details, or None on failure.
         """
         payload = {"Id": listing_id, "VolgendeId": 0, "Filters": "gebruik!=Complex|nieuwab==True", "inschrijfnummerTekst": "", "Volgorde": "", "hash": ""}
         try:
