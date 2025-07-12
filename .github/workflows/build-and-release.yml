@@ -1,66 +1,79 @@
+# This is the name of the workflow as it will appear in the "Actions" tab of your GitHub repository.
 name: Build and Release Executable
 
+# This section defines when the workflow will run.
+# It's configured to trigger on every push to the 'main' branch.
 on:
   push:
     branches:
       - main
 
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel.
 jobs:
   build:
+    # The type of runner that the job will run on. 'windows-latest' is required for building a .exe file.
     runs-on: windows-latest
+
+    # These permissions are required for the 'create-release' and 'upload-release-asset' steps
+    # to interact with your repository (create tags, releases, and upload files).
     permissions:
       contents: write
 
     steps:
-    - name: Check out code
-      uses: actions/checkout@v3
+      # Step 1: Check out your repository's code so the workflow can access it.
+      - name: Check out code
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11' 
+      # Step 2: Set up the Python environment.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          # This is a key optimization: it caches your dependencies so they don't have to be
+          # downloaded from scratch on every single run, making your workflow much faster.
+          cache: 'pip'
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        # It's better to install from a requirements.txt file
-        # Make sure ttkbootstrap, requests, selenium, pillow, keyring, webdriver-manager are in it
-        pip install pyinstaller ttkbootstrap requests selenium pillow keyring webdriver-manager
+      # Step 3: Install all the required Python packages from your requirements file.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
 
-    - name: Build the executable with spec file
-      run: pyinstaller hybrid_bot.spec
+      # Step 4: Build the executable using the correct .spec file.
+      # This is the most reliable way to build, as it uses the exact same configuration
+      # (including bundled files like chromedriver.exe) every time.
+      - name: Build the executable from .spec file
+        run: pyinstaller WoonnetRijnmondBot.spec
 
-    - name: Archive release artifacts
-      run: |
-        # The output from the spec file is a folder named 'hybrid_bot' inside 'dist'
-        # We will zip this folder to create a clean release file.
-        $releasename = "WoonnetRijnmondBot-v${{ github.run_number }}"
-        Compress-Archive -Path ./dist/hybrid_bot/* -DestinationPath "./${releasename}.zip"
-        echo "RELEASE_NAME=${releasename}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        echo "ASSET_PATH=./${releasename}.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        echo "ASSET_NAME=${releasename}.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      # Step 5: Create a new release on GitHub.
+      # This action uses the GITHUB_TOKEN secret automatically provided by GitHub.
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Using a "v" prefix (e.g., v1, v2) is standard practice for version tags.
+          tag_name: v${{ github.run_number }}
+          release_name: Release ${{ github.run_number }}
+          body: |
+            Automated release for commit ${{ github.sha }}.
+            This build includes the WoonnetRijnmondBot application.
+          draft: false
+          prerelease: false
 
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: v${{ github.run_number }}
-        release_name: ${{ env.RELEASE_NAME }}
-        body: |
-          Automated release for commit ${{ github.sha }}.
-          Download the ZIP file below, extract it, and run `hybrid_bot.exe`.
-        draft: false
-        prerelease: false
-
-    - name: Upload Release Asset
-      id: upload-release-asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ${{ env.ASSET_PATH }}
-        asset_name: ${{ env.ASSET_NAME }}
-        asset_content_type: application/zip
+      # Step 6: Upload the compiled .exe file as an asset to the release created above.
+      - name: Upload Release Asset
+        id: upload-release-asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # This URL comes from the output of the 'Create GitHub Release' step.
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          # The asset_path points to the executable created by PyInstaller. The name matches
+          # the 'name' parameter inside your WoonnetRijnmondBot.spec file.
+          asset_path: ./dist/WoonnetRijnmondBot.exe
+          asset_name: WoonnetRijnmondBot.exe
+          asset_content_type: application/vnd.microsoft.portable-executable
