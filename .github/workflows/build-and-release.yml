@@ -28,7 +28,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # It's good practice to specify a version
+          python-version: '3.11'
           # This is a key optimization: it caches your dependencies so they don't have to be
           # downloaded from scratch on every single run, making your workflow much faster.
           cache: 'pip'
@@ -40,7 +40,7 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # Step 4: Build the executable using the .spec file.
+      # Step 4: Build the executable using the correct .spec file.
       # This is the most reliable way to build, as it uses the exact same configuration
       # (including bundled files like chromedriver.exe) every time.
       - name: Build the executable from .spec file
@@ -48,14 +48,14 @@ jobs:
 
       # Step 5: Create a new release on GitHub.
       # This action uses the GITHUB_TOKEN secret automatically provided by GitHub.
-      # The tag name is set to the unique run number (e.g., 1, 2, 3...) for simple versioning.
       - name: Create GitHub Release
         id: create_release
         uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.run_number }}
+          # Using a "v" prefix (e.g., v1, v2) is standard practice for version tags.
+          tag_name: v${{ github.run_number }}
           release_name: Release ${{ github.run_number }}
           body: |
             Automated release for commit ${{ github.sha }}.
