@@ -1,4 +1,14 @@
-keyring
-ttkbootstrap
+# Web Scraping & Automation
+requests
 selenium
+beautifulsoup4
+
+# GUI
+ttkbootstrap
+Pillow
+
+# System & Security
+keyring
+
+# Selenium Driver Management (for local development)
 webdriver-manager
