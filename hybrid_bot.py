@@ -1,41 +1,61 @@
-import json
-import os
-import sys
-import threading
-import io
-import logging
-import webbrowser
+# hybrid_bot.py
+import json, os, sys, threading, io, logging, webbrowser
+from logging.handlers import RotatingFileHandler # NEW
 from queue import Queue
 import keyring
 import requests
 from typing import Dict, Any
-from datetime import datetime, time as dt_time
+from datetime import datetime
 
 import ttkbootstrap as ttk
-from ttkbootstrap.constants import (DISABLED, NORMAL, END, NSEW, W, X, BOTH, EW, SUCCESS, DANGER, WARNING)
+from ttkbootstrap.constants import *
 from ttkbootstrap.scrolled import ScrolledFrame
 from tkinter import messagebox, PhotoImage
 from PIL import Image, ImageTk, ImageDraw
 
 from bot import WoonnetBot
-from config import BASE_URL
+# MODIFIED: Import more from config
+from config import BASE_URL, PRE_SELECTION_HOUR, PRE_SELECTION_MINUTE, FINAL_REFRESH_HOUR, FINAL_REFRESH_MINUTE
+from reporting import send_discord_report # NEW
 
 # --- Setup ---
-APP_NAME = "WoonnetBot"; logger = logging.getLogger(APP_NAME)
+APP_NAME = "WoonnetBot"
+APP_VERSION = "3.3" # NEW: Versioning in the title
+logger = logging.getLogger(APP_NAME)
+LOG_FILE = "" # NEW: Global var for log file path
+
 def get_app_dir():
     appdata = os.environ.get('APPDATA')
     if not appdata: return os.path.join(os.path.expanduser("~"), f".{APP_NAME}")
     return os.path.join(appdata, APP_NAME)
-APP_DIR = get_app_dir(); PREFS_FILE = os.path.join(APP_DIR, 'user_prefs.json'); SERVICE_ID = f"python:{APP_NAME}"
+APP_DIR = get_app_dir()
+PREFS_FILE = os.path.join(APP_DIR, 'user_prefs.json')
+SERVICE_ID = f"python:{APP_NAME}"
 
+# MODIFIED: Set up both stream and file logging
 def setup_logging():
+    global LOG_FILE
+    os.makedirs(APP_DIR, exist_ok=True)
+    LOG_FILE = os.path.join(APP_DIR, 'bot.log')
+    
     logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    if not logger.handlers: logger.addHandler(handler)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    # Avoid adding handlers multiple times
+    if not logger.handlers:
+        # Console handler
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+
+        # File handler (rotates after 1MB, keeps 3 backups)
+        file_handler = RotatingFileHandler(LOG_FILE, maxBytes=1*1024*1024, backupCount=3, encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
 setup_logging()
 
+# ... (The `crop_to_square` and `create_placeholder_image` functions are unchanged) ...
 def crop_to_square(image: Image.Image) -> Image.Image:
     w, h = image.size; short = min(w, h); l, t = (w - short) / 2, (h - short) / 2
     return image.crop((l, t, l + short, t + short))
@@ -46,34 +66,25 @@ def create_placeholder_image(size=(120, 120)):
     except Exception: draw.text((10, 10), "No Image", fill='black')
     return ImageTk.PhotoImage(img)
 
-# --- Custom Widget ---
+# ... (ListingWidget is unchanged) ...
 class ListingWidget(ttk.Frame):
     def __init__(self, parent, data: Dict[str, Any], session: requests.Session, placeholder_img, **kwargs):
         super().__init__(parent, borderwidth=1, relief="solid", **kwargs)
         self.grid_columnconfigure(2, weight=1)
         self.data = data; self.session = session; self.selected = ttk.BooleanVar()
-        
-        # *** MODIFIED: Use new keys from the bot for more control ***
         is_selectable = data.get('is_selectable', False)
         status_text = data.get('status_text', 'N/A')
-
         self.image = self._load_image(data.get('image_url'), (120, 120)) or placeholder_img
         self.image_label = ttk.Label(self, image=self.image, cursor="hand2")
         self.image_label.grid(row=0, column=1, rowspan=2, sticky='nsew', padx=(0, 15))
         detail_url = f"{BASE_URL}/detail/{self.data['id']}"
         self.image_label.bind("<Button-1>", lambda e: webbrowser.open_new_tab(detail_url))
-
-        # *** MODIFIED: Checkbox state is now controlled by 'is_selectable' ***
         cb = ttk.Checkbutton(self, variable=self.selected, state=NORMAL if is_selectable else DISABLED)
         cb.grid(row=0, column=0, rowspan=2, padx=10, sticky='ns')
-
         info_frame = ttk.Frame(self); info_frame.grid(row=0, column=2, rowspan=2, sticky=NSEW, pady=5)
-        
-        # *** MODIFIED: Set label color based on the status text ***
         if "LIVE" in status_text: status_style = SUCCESS
         elif "SELECTABLE" in status_text: status_style = WARNING
         else: status_style = 'secondary'
-        
         ttk.Label(info_frame, text=status_text, bootstyle=status_style).pack(anchor='ne') # type: ignore
         ttk.Label(info_frame, text=data.get('address', 'N/A'), font="-weight bold").pack(anchor=W)
         ttk.Label(info_frame, text=f"{data.get('type', 'N/A')} | {data.get('price_str', 'N/A')}").pack(anchor=W)
@@ -87,22 +98,25 @@ class ListingWidget(ttk.Frame):
             return ImageTk.PhotoImage(img)
         except Exception: return None
 
-# --- Main Application ---
 class App(ttk.Window):
     def __init__(self):
-        super().__init__(themename="litera", title="Woonnet Bot v3.2 (Pre-selection Update)", size=(600, 750), minsize=(550, 400))
+        # MODIFIED: Add version to title
+        super().__init__(themename="litera", title=f"Woonnet Bot v{APP_VERSION}", size=(600, 750), minsize=(550, 400))
         self.grid_columnconfigure(0, weight=1); self.grid_rowconfigure(1, weight=1)
         
         self.status_queue = Queue(); self.placeholder_img = create_placeholder_image()
         self.listing_widgets: list[ListingWidget] = []
         self.api_session: requests.Session | None = None
         
-        self.bot_instance = WoonnetBot(self.status_queue, logger)
+        # MODIFIED: Pass the log file path to the bot instance
+        self.bot_instance = WoonnetBot(self.status_queue, logger, LOG_FILE)
         threading.Thread(target=self.bot_instance.start_headless_browser, daemon=True).start()
 
         self.create_widgets(); self.load_preferences(); self.set_controls_state('initial')
-        self.after(100, self.process_status_queue); self.after(60000, self.scheduled_refresh_check)
+        self.after(100, self.process_status_queue)
+        self.after(60000, self.scheduled_refresh_check)
 
+    # ... (create_widgets is unchanged) ...
     def create_widgets(self):
         main_frame = ttk.Frame(self, padding=10); main_frame.grid(row=0, column=0, sticky=NSEW)
         main_frame.grid_columnconfigure(0, weight=1)
@@ -132,6 +146,7 @@ class App(ttk.Window):
         status_frame.grid_columnconfigure(0, weight=1)
         self.status_label = ttk.Label(status_frame, text="Waiting for browser to start...", anchor=W); self.status_label.grid(row=0, column=0, sticky=EW)
 
+    # ... (set_controls_state, start_login, run_login_wrapper, start_discovery, run_discovery_wrapper, start_apply, run_apply_wrapper are mostly unchanged) ...
     def set_controls_state(self, state: str):
         if state == 'initial':
             self.login_button.config(state=NORMAL); self.discover_button.config(state=DISABLED); self.apply_button.config(state=DISABLED)
@@ -139,7 +154,6 @@ class App(ttk.Window):
             self.login_button.config(state=DISABLED); self.discover_button.config(state=DISABLED); self.apply_button.config(state=DISABLED)
         elif state == 'logged_in':
             self.login_button.config(state=DISABLED); self.discover_button.config(state=NORMAL)
-            # *** MODIFIED: Apply button is enabled if ANY listing is selectable ***
             any_selectable = any(w.data.get('is_selectable', False) for w in self.listing_widgets)
             self.apply_button.config(state=NORMAL if any_selectable else DISABLED)
 
@@ -155,7 +169,6 @@ class App(ttk.Window):
             self.api_session = session
             if self.remember_check.instate(['selected']): self.save_credentials(username, password)
         self.after(0, self.set_controls_state, 'logged_in' if login_success else 'initial')
-        # *** NEW: Automatically discover listings on successful login ***
         if login_success:
             self.after(100, self.start_discovery)
 
@@ -165,8 +178,7 @@ class App(ttk.Window):
 
     def run_discovery_wrapper(self):
         listings = self.bot_instance.discover_listings_api()
-        # Using put instead of put_nowait as this is from a thread
-        self.status_queue.put(listings)
+        self.status_queue.put(listings) # Use put, not put_nowait from a thread
         self.after(0, self.set_controls_state, 'logged_in')
 
     def start_apply(self):
@@ -179,15 +191,18 @@ class App(ttk.Window):
         self.bot_instance.apply_to_listings(ids_to_apply)
         self.after(0, self.set_controls_state, 'logged_in')
 
+    # MODIFIED: Use config values for scheduled refresh
     def scheduled_refresh_check(self):
         now = datetime.now()
-        # *** MODIFIED: Refresh at 18:00 to enable selection, and at 19:55 for final status ***
         if self.bot_instance and self.bot_instance.is_logged_in:
-            if (now.hour == 18 and now.minute == 0) or (now.hour == 19 and now.minute == 55):
-                logger.info(f"--- TRIGGERING SCHEDULED REFRESH AT {now.time()} ---")
+            is_pre_selection_time = (now.hour == PRE_SELECTION_HOUR and now.minute == PRE_SELECTION_MINUTE)
+            is_final_refresh_time = (now.hour == FINAL_REFRESH_HOUR and now.minute == FINAL_REFRESH_MINUTE)
+            if is_pre_selection_time or is_final_refresh_time:
+                logger.info(f"--- TRIGGERING SCHEDULED REFRESH AT {now.time():%H:%M} ---")
                 self.start_discovery()
         self.after(60000, self.scheduled_refresh_check)
 
+    # ... (process_status_queue, populate_listings, load_preferences, save_credentials, on_closing are mostly unchanged) ...
     def process_status_queue(self):
         while not self.status_queue.empty():
             message = self.status_queue.get_nowait()
@@ -209,7 +224,6 @@ class App(ttk.Window):
                 if data['id'] in selected_before: widget.selected.set(True)
                 widget.pack(fill=X, pady=5, padx=5)
                 self.listing_widgets.append(widget)
-        # *** NEW: After populating, re-evaluate the control states ***
         self.set_controls_state('logged_in')
 
     def load_preferences(self):
@@ -229,8 +243,14 @@ class App(ttk.Window):
         if self.bot_instance: self.bot_instance.quit()
         self.destroy()
 
+
 if __name__ == "__main__":
-    os.makedirs(APP_DIR, exist_ok=True)
-    app = App()
-    app.protocol("WM_DELETE_WINDOW", app.on_closing)
-    app.mainloop()
+    try:
+        app = App()
+        app.protocol("WM_DELETE_WINDOW", app.on_closing)
+        app.mainloop()
+    except Exception as e:
+        # NEW: Global exception handler to catch anything that slips through
+        logger.critical(f"A fatal, unhandled error occurred in the main application loop: {e}", exc_info=True)
+        send_discord_report(e, "in the main application __main__ block", LOG_FILE)
+        messagebox.showerror("Fatal Error", f"A critical error occurred: {e}\n\nA report has been sent. Please check bot.log for details.")
