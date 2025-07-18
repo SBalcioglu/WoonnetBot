@@ -40,7 +40,7 @@ jobs:
           Expand-Archive -Path chromedriver.zip -DestinationPath .
           
           # Move chromedriver.exe to the root directory where the .spec file expects it
-          Move-Item -Path "chromedriver-win64/chromedriver.exe" -Destination "chromedriver.exe"
+          Move-Item -Path "chromedriver-win64/chromedriver.exe" -Destination "chromedriver.exe" -Force
 
       # MODIFIED: Build using the spec file for consistency
       - name: Build the executable from .spec file
