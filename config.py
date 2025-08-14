@@ -8,6 +8,7 @@ DISCOVERY_URL = f"{BASE_URL}/nieuw-aanbod/"
 
 # --- API ENDPOINTS ---
 API_DISCOVERY_URL = "https://www.woonnetrijnmond.nl/wsWoonnetRijnmond/Woonwensen/wsWoonwensen.asmx/GetWoonwensResultatenVoorPagina"
+API_DISCOVERY_ALL_URL = "https://www.woonnetrijnmond.nl/wsWoonnetRijnmond/Woonwensen/wsWoonwensen.asmx/GetWoonwensResultatenVoorPaginaByInschrijfnummer"  # NEW: All actuele + upcoming listings for account
 API_DETAILS_SINGLE_URL = "https://www.woonnetrijnmond.nl/wsWoonnetRijnmond/WoningenModule/Service.asmx/getAanbodEnVolgendeViaId"
 API_TIMER_URL = "https://www.woonnetrijnmond.nl/Umbraco/api/SqlServerTime/GetTijdTotNieuwAanbod"
 
