@@ -208,3 +208,7 @@ __marimo__/
 
 # ChromeDriver
 chromedriver.exe
+
+# Built executables (use GitHub Releases instead)
+WoonnetRijnmondBot.exe
+hybrid_bot.exe
