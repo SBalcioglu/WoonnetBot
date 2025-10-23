@@ -12,9 +12,9 @@ A Python-based bot to automate rental applications on the WoonnetRijnmond websit
 
 ## How to Use
 
-The easiest way to use this bot is to download the latest executable from the **[Releases](https://github.com/SBalcioglu/WoonnetRijnmondBot/releases)** page.
+The easiest way to use this bot is to download the latest executable from the **[Releases](https://github.com/SBalcioglu/WoonnetBot/releases)** page.
 
-1.  Go to the [Releases](https://github.com/SBalcioglu/WoonnetRijnmondBot/releases) section on the right.
+1.  Go to the [Releases](https://github.com/SBalcioglu/WoonnetBot/releases) section on the right.
 2.  Download the `WoonnetRijnmondBot.exe` file from the latest release.
 3.  Run the executable file.
 4.  Enter your WoonnetRijnmond username and password.
